@@ -770,11 +770,14 @@ fn connection_pipeline(
             0
         };
 
-    *ctx.game_audio_sample_rate.lock() = if game_audio_sample_rate == 0 {
-        48000
-    } else {
-        game_audio_sample_rate
-    };
+    ctx.game_audio_sample_rate.store(
+        if game_audio_sample_rate == 0 {
+            48000
+        } else {
+            game_audio_sample_rate
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     let wired = client_ip.is_loopback();
 
@@ -934,6 +937,13 @@ fn connection_pipeline(
                     } else {
                         continue;
                     };
+
+                    // Keep WAV header in sync with the live loopback stream rate.
+                    if let Ok(rate) = alvr_audio::input_sample_rate(&device) {
+                        ctx.game_audio_sample_rate
+                            .store(rate, std::sync::atomic::Ordering::Relaxed);
+                        alvr_common::info!("Game audio loopback sample rate: {rate} Hz");
+                    }
 
                     let tee = {
                         let ctx = Arc::clone(&ctx);

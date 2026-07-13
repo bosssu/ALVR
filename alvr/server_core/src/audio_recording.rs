@@ -1,36 +1,26 @@
-use alvr_common::{
-    anyhow::{Context, Result},
-    parking_lot::Mutex as ParkingMutex,
-};
+use alvr_common::anyhow::{Context, Result};
 use std::{
     fs::File,
     io::{Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
     thread::{self, JoinHandle},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioRecState {
     Idle,
-    Armed,
     Recording,
 }
 
-/// PCM s16le WAV writer. Loopback samples are queued (never block the audio callback);
-/// a dedicated thread writes the file so video-path locks cannot drop audio.
+/// PCM s16le WAV writer. Loopback samples are queued on a dedicated thread so the
+/// audio callback never blocks on disk I/O or the video path.
 pub struct AudioRecordingWriter {
     state: AudioRecState,
-    stem: Option<PathBuf>,
     sample_rate: u32,
     channels: u16,
-    /// True while Armed and waiting for first video bytes to open the WAV.
-    pending_open: Arc<AtomicBool>,
     pcm_tx: Option<flume::Sender<Vec<u8>>>,
     writer_join: Option<JoinHandle<Result<u32>>>,
+    path: Option<PathBuf>,
 }
 
 impl Default for AudioRecordingWriter {
@@ -43,12 +33,11 @@ impl AudioRecordingWriter {
     pub fn new() -> Self {
         Self {
             state: AudioRecState::Idle,
-            stem: None,
             sample_rate: 48000,
             channels: 2,
-            pending_open: Arc::new(AtomicBool::new(false)),
             pcm_tx: None,
             writer_join: None,
+            path: None,
         }
     }
 
@@ -56,36 +45,25 @@ impl AudioRecordingWriter {
         self.state
     }
 
-    /// Cheap check for the video path: only take the audio mutex when this is true.
-    pub fn needs_video_open(&self) -> bool {
-        self.pending_open.load(Ordering::Acquire)
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 
-    /// Prepare to record; WAV is created on first video write.
-    pub fn arm(&mut self, stem: PathBuf, sample_rate: u32, channels: u16) {
+    /// Start recording immediately (same wall-clock moment as the video file is created).
+    /// `sample_rate` must match the live loopback device rate used by `record_audio_blocking`.
+    pub fn start(&mut self, stem: PathBuf, sample_rate: u32, channels: u16) -> Result<()> {
         let _ = self.finalize();
-        self.stem = Some(stem);
-        self.sample_rate = sample_rate.max(1);
-        self.channels = channels.max(1);
-        self.state = AudioRecState::Armed;
-        self.pending_open.store(true, Ordering::Release);
-    }
 
-    pub fn on_video_bytes_written(&mut self) -> Result<()> {
-        if self.state != AudioRecState::Armed {
-            return Ok(());
-        }
-        let path = self
-            .stem
-            .as_ref()
-            .map(|s| crate::capture_paths::with_media_ext(s, "wav"))
-            .context("no recording stem")?;
+        let sample_rate = sample_rate.max(1);
+        let channels = channels.max(1);
+        let path = crate::capture_paths::with_media_ext(&stem, "wav");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let mut file = File::create(&path)?;
-        write_wav_header_placeholder(&mut file, self.sample_rate, self.channels)?;
+        let mut file = File::create(&path)
+            .with_context(|| format!("create wav {}", path.display()))?;
+        write_wav_header_placeholder(&mut file, sample_rate, channels)?;
 
         let (tx, rx) = flume::unbounded::<Vec<u8>>();
         let join = thread::spawn(move || -> Result<u32> {
@@ -94,50 +72,60 @@ impl AudioRecordingWriter {
                 file.write_all(&chunk)?;
                 data_bytes = data_bytes.saturating_add(chunk.len() as u32);
             }
-            // Channel closed: patch sizes before file drops.
             patch_wav_sizes(&mut file, data_bytes)?;
             file.flush()?;
             Ok(data_bytes)
         });
 
+        self.sample_rate = sample_rate;
+        self.channels = channels;
         self.pcm_tx = Some(tx);
         self.writer_join = Some(join);
+        self.path = Some(path);
         self.state = AudioRecState::Recording;
-        self.pending_open.store(false, Ordering::Release);
+
+        alvr_common::info!(
+            "Recording WAV started ({} Hz, {} ch): {}",
+            sample_rate,
+            channels,
+            self.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+        );
         Ok(())
     }
 
-    /// Non-blocking: queue samples for the writer thread. Safe to call from WASAPI/cpal callback.
+    /// Non-blocking queue; safe from the WASAPI/cpal callback.
     pub fn write_pcm_bytes(&mut self, bytes: &[u8]) {
         if self.state != AudioRecState::Recording {
             return;
         }
         if let Some(tx) = &self.pcm_tx {
-            // Unbounded queue — never blocks the audio callback.
             let _ = tx.send(bytes.to_vec());
         }
     }
 
     pub fn finalize(&mut self) -> Result<()> {
-        self.pending_open.store(false, Ordering::Release);
-        // Drop sender so writer thread exits and patches the header.
         self.pcm_tx = None;
         if let Some(join) = self.writer_join.take() {
             match join.join() {
-                Ok(Ok(_bytes)) => {}
+                Ok(Ok(data_bytes)) => {
+                    let secs = data_bytes as f64
+                        / (self.sample_rate as f64 * self.channels as f64 * 2.0);
+                    alvr_common::info!(
+                        "Recording WAV finished: {data_bytes} bytes, ~{secs:.2}s at {} Hz",
+                        self.sample_rate
+                    );
+                }
                 Ok(Err(e)) => {
-                    self.stem = None;
                     self.state = AudioRecState::Idle;
+                    self.path = None;
                     return Err(e);
                 }
                 Err(_) => {
-                    self.stem = None;
-                    self.state = AudioRecState::Idle;
                     alvr_common::error!("Audio recording writer thread panicked");
                 }
             }
         }
-        self.stem = None;
+        self.path = None;
         self.state = AudioRecState::Idle;
         Ok(())
     }
@@ -172,31 +160,13 @@ fn patch_wav_sizes(file: &mut File, data_bytes: u32) -> Result<()> {
     Ok(())
 }
 
-/// Shared flag for video path without taking the full writer lock every frame.
-pub fn note_video_if_pending(writer: &ParkingMutex<AudioRecordingWriter>) {
-    // Fast path: no open pending.
-    let pending = {
-        let w = writer.lock();
-        if !w.needs_video_open() {
-            return;
-        }
-        true
-    };
-    if !pending {
-        return;
-    }
-    if let Err(e) = writer.lock().on_video_bytes_written() {
-        alvr_common::error!("Failed to open recording WAV: {e}");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Read;
 
     #[test]
-    fn arm_then_first_video_opens_wav() {
+    fn start_writes_wav_immediately() {
         let dir = std::env::temp_dir().join(format!(
             "alvr_audio_rec_test_{}",
             std::process::id()
@@ -205,28 +175,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let stem = dir.join("recording_test");
         let mut w = AudioRecordingWriter::new();
-        w.arm(stem.clone(), 48000, 2);
-        assert_eq!(w.state(), AudioRecState::Armed);
-        assert!(w.needs_video_open());
-        w.on_video_bytes_written().unwrap();
+        w.start(stem.clone(), 44100, 2).unwrap();
         assert_eq!(w.state(), AudioRecState::Recording);
-        assert!(!w.needs_video_open());
+        assert_eq!(w.sample_rate(), 44100);
         w.write_pcm_bytes(&[0, 0, 0, 0, 100, 0, 156, 255]);
         w.finalize().unwrap();
         let mut f = File::open(crate::capture_paths::with_media_ext(&stem, "wav")).unwrap();
-        let mut hdr = [0u8; 12];
+        let mut hdr = [0u8; 44];
         f.read_exact(&mut hdr).unwrap();
         assert_eq!(&hdr[0..4], b"RIFF");
         assert_eq!(&hdr[8..12], b"WAVE");
+        // sample rate little-endian at offset 24
+        let rate = u32::from_le_bytes([hdr[24], hdr[25], hdr[26], hdr[27]]);
+        assert_eq!(rate, 44100);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn finalize_armed_without_open_is_ok() {
-        let mut w = AudioRecordingWriter::new();
-        w.arm(std::env::temp_dir().join("alvr_nope_recording"), 44100, 2);
-        w.finalize().unwrap();
-        assert_eq!(w.state(), AudioRecState::Idle);
     }
 
     #[test]

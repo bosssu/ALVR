@@ -47,7 +47,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, LazyLock, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{self, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -118,17 +118,13 @@ pub struct ConnectionContext {
     video_mirror_sender: Mutex<Option<broadcast::Sender<Vec<u8>>>>,
     video_recording_file: Mutex<Option<File>>,
     pub(crate) audio_recording: Mutex<audio_recording::AudioRecordingWriter>,
-    pub(crate) game_audio_sample_rate: Mutex<u32>,
+    /// Live loopback rate from the game-audio capture stream (updated when stream starts).
+    pub(crate) game_audio_sample_rate: std::sync::atomic::AtomicU32,
     pub(crate) feedback_sounds: feedback_sounds::FeedbackSounds,
     connection_threads: Mutex<Vec<JoinHandle<()>>>,
     clients_to_be_removed: Mutex<HashSet<String>>,
     video_channel_sender: Mutex<Option<SyncSender<VideoPacket>>>,
     haptics_sender: Mutex<Option<StreamSender<Haptics>>>,
-}
-
-fn note_video_recording_bytes(connection_context: &ConnectionContext) {
-    // Only locks when a WAV open is still pending (first video bytes after arm).
-    audio_recording::note_video_if_pending(&connection_context.audio_recording);
 }
 
 pub fn create_recording_file(connection_context: &ConnectionContext, settings: &Settings) {
@@ -149,7 +145,7 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
     let stem = dir.join(capture_paths::recording_stem(chrono::Local::now()));
     let video_path = capture_paths::with_media_ext(&stem, ext);
 
-    // Play start tone before arming capture so most of the beep is outside the WAV.
+    // Play start tone before opening capture so most of the beep is outside the WAV.
     connection_context.feedback_sounds.play(
         feedback_sounds::FeedbackKind::RecStart,
         settings.extra.capture.feedback_sounds_enabled,
@@ -157,24 +153,24 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
 
     match File::create(&video_path) {
         Ok(mut file) => {
-            let mut wrote_config = false;
             if let Some(config) = &*connection_context.decoder_config.lock() {
-                if file.write_all(&config.config_buffer).is_ok() {
-                    wrote_config = true;
-                }
+                file.write_all(&config.config_buffer).ok();
             }
 
             *connection_context.video_recording_file.lock() = Some(file);
 
-            let sample_rate = *connection_context.game_audio_sample_rate.lock();
+            // Must match the live loopback rate (see connection game-audio thread).
+            let sample_rate = connection_context
+                .game_audio_sample_rate
+                .load(Ordering::Relaxed);
             let sample_rate = if sample_rate == 0 { 48000 } else { sample_rate };
-            connection_context
+
+            if let Err(e) = connection_context
                 .audio_recording
                 .lock()
-                .arm(stem, sample_rate, 2);
-
-            if wrote_config {
-                note_video_recording_bytes(connection_context);
+                .start(stem, sample_rate, 2)
+            {
+                error!("Failed to start recording WAV: {e}");
             }
 
             connection_context
@@ -194,9 +190,9 @@ pub fn stop_recording(connection_context: &ConnectionContext) {
 
 pub fn stop_recording_with_feedback(connection_context: &ConnectionContext, play_sound: bool) {
     let was_recording = connection_context.video_recording_file.lock().is_some()
-        || !matches!(
+        || matches!(
             connection_context.audio_recording.lock().state(),
-            audio_recording::AudioRecState::Idle
+            audio_recording::AudioRecState::Recording
         );
 
     *connection_context.video_recording_file.lock() = None;
@@ -319,7 +315,7 @@ impl ServerCoreContext {
             video_mirror_sender: Mutex::new(None),
             video_recording_file: Mutex::new(None),
             audio_recording: Mutex::new(audio_recording::AudioRecordingWriter::new()),
-            game_audio_sample_rate: Mutex::new(48000),
+            game_audio_sample_rate: AtomicU32::new(48000),
             feedback_sounds: feedback_sounds::FeedbackSounds::start(),
             connection_threads: Mutex::new(Vec::new()),
             clients_to_be_removed: Mutex::new(HashSet::new()),
@@ -488,16 +484,8 @@ impl ServerCoreContext {
             sender.send(config_buffer.clone()).ok();
         }
 
-        let wrote_recording = if let Some(file) =
-            &mut *self.connection_context.video_recording_file.lock()
-        {
-            file.write_all(&config_buffer).is_ok()
-        } else {
-            false
-        };
-        // Release video file lock before touching audio recording.
-        if wrote_recording {
-            note_video_recording_bytes(&self.connection_context);
+        if let Some(file) = &mut *self.connection_context.video_recording_file.lock() {
+            file.write_all(&config_buffer).ok();
         }
 
         *self.connection_context.decoder_config.lock() = Some(DecoderInitializationConfig {
@@ -562,15 +550,8 @@ impl ServerCoreContext {
                     sender.send(nal_buffer.clone()).ok();
                 }
 
-                let wrote_recording = if let Some(file) =
-                    &mut *self.connection_context.video_recording_file.lock()
-                {
-                    file.write_all(&nal_buffer).is_ok()
-                } else {
-                    false
-                };
-                if wrote_recording {
-                    note_video_recording_bytes(&self.connection_context);
+                if let Some(file) = &mut *self.connection_context.video_recording_file.lock() {
+                    file.write_all(&nal_buffer).ok();
                 }
 
                 let sender_result = sender.try_send(VideoPacket {

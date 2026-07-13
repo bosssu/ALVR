@@ -251,6 +251,7 @@ pub fn record_audio_blocking(
     device: &Device,
     channels_count: u16,
     mute: bool,
+    mut tee: Option<Box<dyn FnMut(&[u8]) + Send>>,
 ) -> Result<()> {
     let config = device
         .default_input_config()
@@ -299,6 +300,10 @@ pub fn record_audio_blocking(
                 };
 
                 let data = downmix_audio(data, config.channels(), channels_count);
+
+                if let Some(tee) = tee.as_mut() {
+                    tee(&data);
+                }
 
                 if is_running() {
                     sender.send_header_with_payload(&(), &data).ok();

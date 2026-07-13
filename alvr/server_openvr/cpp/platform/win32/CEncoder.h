@@ -9,6 +9,7 @@
 #include "VideoEncoderNVENC.h"
 #include "VideoEncoderVPL.h"
 #include "alvr_server/Utils.h"
+#include <atomic>
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <map>
@@ -68,6 +69,8 @@ public:
     void CaptureFrame();
 
 private:
+    void SaveScreenshotPng(ID3D11Texture2D* texture);
+
     CThreadEvent m_newFrameReady, m_encodeFinished;
     std::shared_ptr<VideoEncoder> m_videoEncoder;
     bool m_bExiting;
@@ -75,6 +78,8 @@ private:
     uint64_t m_targetTimestampNs;
 
     std::shared_ptr<FrameRender> m_FrameRender;
+    std::shared_ptr<CD3DRender> m_d3dRender;
+    std::atomic_bool m_captureFrame { false };
 
     IDRScheduler m_scheduler;
 };

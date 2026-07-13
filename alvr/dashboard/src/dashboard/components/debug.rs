@@ -5,8 +5,9 @@ pub fn debug_tab_ui(ui: &mut Ui) -> Option<ServerRequest> {
     let mut request = None;
 
     ui.label(
-        "Recording from ALVR using the buttons below is not suitable for capturing gameplay.
-For that, use other means of recording, for example through headset or desktop VR output.",
+        "Capture frame saves an SBS PNG into the configured screenshot folder (default Captures/Captures).
+Start/Stop recording writes elementary video + game-audio WAV into the recording folder (default Captures/Records).
+Global hotkeys (default F8 screenshot / F9 toggle recording) work while the ALVR SteamVR driver is running.",
     );
 
     ui.columns(4, |ui| {

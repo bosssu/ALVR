@@ -58,7 +58,8 @@ fn make_settings(negotiated: Option<&ServerNegotiatedStreamingConfig>) -> Settin
     let hdr = &video.encoder_config.hdr;
 
     let mut capture_frame_dir = [0i8; 1024];
-    let cstr = CString::new(settings.extra.capture.capture_frame_dir.as_str()).unwrap_or_default();
+    let screenshot_dir = alvr_server_core::resolved_screenshot_dir(&settings);
+    let cstr = CString::new(screenshot_dir.to_string_lossy().as_ref()).unwrap_or_default();
     let bytes = cstr.as_bytes_with_nul();
     unsafe {
         std::ptr::copy_nonoverlapping(

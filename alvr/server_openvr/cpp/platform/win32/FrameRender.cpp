@@ -385,6 +385,7 @@ bool FrameRender::Startup() {
     }
 
     m_pStagingTexture = compositionTexture;
+    m_pScreenshotTexture = compositionTexture;
 
     std::vector<uint8_t> quadShaderCSO(
         QUAD_SHADER_CSO_PTR, QUAD_SHADER_CSO_PTR + QUAD_SHADER_CSO_LEN
@@ -435,6 +436,7 @@ bool FrameRender::Startup() {
         );
 
         m_pStagingTexture = colorCorrectedTexture;
+        m_pScreenshotTexture = colorCorrectedTexture;
     }
 
     enableFFE = Settings_Instance()->m_enableFoveatedEncoding;
@@ -882,6 +884,8 @@ bool FrameRender::RenderFrame(
 }
 
 ComPtr<ID3D11Texture2D> FrameRender::GetTexture() { return m_pStagingTexture; }
+
+ComPtr<ID3D11Texture2D> FrameRender::GetScreenshotTexture() { return m_pScreenshotTexture; }
 
 void FrameRender::GetEncodingResolution(uint32_t* width, uint32_t* height) {
     if (enableFFE) {

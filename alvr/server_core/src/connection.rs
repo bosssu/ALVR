@@ -243,7 +243,11 @@ pub fn compute_restart_settings_hash(
     body_tracking_has_legs.hash(&mut h);
     // Misc
     settings.connection.minimum_idr_interval_ms.hash(&mut h);
-    settings.extra.capture.capture_frame_dir.hash(&mut h);
+    settings.extra.capture.screenshot_dir.hash(&mut h);
+    settings.extra.capture.recording_dir.hash(&mut h);
+    settings.extra.capture.hotkeys_enabled.hash(&mut h);
+    settings.extra.capture.screenshot_hotkey.hash(&mut h);
+    settings.extra.capture.recording_hotkey.hash(&mut h);
     settings.video.bitrate.image_corruption_fix.hash(&mut h);
     // Debug groups
     dbg.server_impl.hash(&mut h);
@@ -767,6 +771,12 @@ fn connection_pipeline(
             0
         };
 
+    *ctx.game_audio_sample_rate.lock() = if game_audio_sample_rate == 0 {
+        48000
+    } else {
+        game_audio_sample_rate
+    };
+
     let wired = client_ip.is_loopback();
 
     dbg_connection!("connection_pipeline: send streaming config");
@@ -894,7 +904,6 @@ fn connection_pipeline(
     let game_audio_thread = if let Switch::Enabled(config) =
         initial_settings.audio.game_audio.clone()
     {
-        #[cfg(windows)]
         let ctx = Arc::clone(&ctx);
 
         let client_hostname = client_hostname.clone();
@@ -927,6 +936,14 @@ fn connection_pipeline(
                         continue;
                     };
 
+                    let tee = {
+                        let ctx = Arc::clone(&ctx);
+                        Some(Box::new(move |bytes: &[u8]| {
+                            let _ = ctx.audio_recording.lock().write_pcm_bytes(bytes);
+                        })
+                            as Box<dyn FnMut(&[u8]) + Send>)
+                    };
+
                     if let Err(e) = alvr_audio::record_audio_blocking(
                         Arc::new({
                             let client_hostname = client_hostname.clone();
@@ -936,6 +953,7 @@ fn connection_pipeline(
                         &device,
                         2,
                         config.mute_when_streaming,
+                        tee,
                     ) {
                         error!("Audio record error: {e:?}");
                     }
@@ -1394,7 +1412,7 @@ fn connection_pipeline(
     *ctx.video_channel_sender.lock() = None;
     *ctx.haptics_sender.lock() = None;
 
-    *ctx.video_recording_file.lock() = None;
+    crate::stop_recording_with_feedback(&ctx, false);
 
     session_manager_lock.update_client_connections(
         client_hostname,

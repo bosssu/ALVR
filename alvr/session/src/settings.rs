@@ -1566,8 +1566,36 @@ pub struct CaptureConfig {
 
     pub rolling_video_files: Switch<RollingVideoFilesConfig>,
 
+    #[schema(strings(display_name = "Enable global hotkeys"))]
+    pub hotkeys_enabled: bool,
+
+    #[schema(strings(
+        display_name = "Screenshot hotkey",
+        help = "Examples: F8, Ctrl+F8, PrintScreen. Case-insensitive; modifiers: Ctrl, Alt, Shift, Win."
+    ))]
+    pub screenshot_hotkey: String,
+
+    #[schema(strings(
+        display_name = "Recording hotkey",
+        help = "Same key toggles start/stop. Examples: F9, Ctrl+F9."
+    ))]
+    pub recording_hotkey: String,
+
+    #[schema(strings(display_name = "Feedback sounds"))]
+    pub feedback_sounds_enabled: bool,
+
+    #[schema(strings(
+        display_name = "Recording folder",
+        help = "Relative to ALVR install root, or absolute. Video + WAV written here."
+    ))]
+    pub recording_dir: String,
+
+    #[schema(strings(
+        display_name = "Screenshot folder",
+        help = "Relative to ALVR install root, or absolute. SBS PNG written here."
+    ))]
     #[schema(flag = "steamvr-restart")]
-    pub capture_frame_dir: String,
+    pub screenshot_dir: String,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
@@ -2243,11 +2271,12 @@ pub fn session_settings_default() -> SettingsDefault {
                     enabled: false,
                     content: RollingVideoFilesConfigDefault { duration_s: 5 },
                 },
-                capture_frame_dir: if !cfg!(target_os = "linux") {
-                    "/tmp".into()
-                } else {
-                    "".into()
-                },
+                hotkeys_enabled: true,
+                screenshot_hotkey: "F8".into(),
+                recording_hotkey: "F9".into(),
+                feedback_sounds_enabled: true,
+                recording_dir: "Captures/Records".into(),
+                screenshot_dir: "Captures/Captures".into(),
             },
             patches: PatchesDefault {
                 linux_async_compute: false,

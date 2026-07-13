@@ -409,12 +409,14 @@ dependencies = [
  "mdns-sd",
  "profiling",
  "rfd",
+ "rodio",
  "rosc",
  "serde",
  "serde_json",
  "sysinfo",
  "tokio",
  "tower-http",
+ "windows 0.62.2",
 ]
 
 [[package]]

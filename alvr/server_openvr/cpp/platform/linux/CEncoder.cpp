@@ -1,8 +1,10 @@
 #include "CEncoder.h"
 
 #include <chrono>
+#include <ctime>
 #include <exception>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <poll.h>
@@ -235,12 +237,15 @@ void CEncoder::Run() {
 
             if (m_captureFrame) {
                 m_captureFrame = false;
-                render.CaptureInputFrame(
-                    std::string(Settings_Instance()->m_captureFrameDir) + "/alvr_frame_input.ppm"
-                );
-                render.CaptureOutputFrame(
-                    std::string(Settings_Instance()->m_captureFrameDir) + "/alvr_frame_output.ppm"
-                );
+                auto now = std::chrono::system_clock::now();
+                auto t = std::chrono::system_clock::to_time_t(now);
+                std::tm tm {};
+                localtime_r(&t, &tm);
+                std::ostringstream name;
+                name << std::string(Settings_Instance()->m_captureFrameDir) << "/screenshot."
+                     << std::put_time(&tm, "%Y-%m-%d.%H-%M-%S");
+                // dumpImage writes PPM; keep extension for the raw dump path
+                render.CaptureOutputFrame(name.str() + ".ppm");
             }
 
             render.Render(frame_info.image, frame_info.semaphore_value);

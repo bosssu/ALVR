@@ -63,10 +63,13 @@ public:
     void GetEncodingResolution(uint32_t* width, uint32_t* height);
 
     ComPtr<ID3D11Texture2D> GetTexture();
+    /// RGB SBS texture after composition/color correction, before FFR/YUV.
+    ComPtr<ID3D11Texture2D> GetScreenshotTexture();
 
 private:
     std::shared_ptr<CD3DRender> m_pD3DRender;
     ComPtr<ID3D11Texture2D> m_pStagingTexture;
+    ComPtr<ID3D11Texture2D> m_pScreenshotTexture;
 
     ComPtr<ID3D11VertexShader> m_pVertexShader;
     ComPtr<ID3D11PixelShader> m_pPixelShader;

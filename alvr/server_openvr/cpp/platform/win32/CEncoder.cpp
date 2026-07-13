@@ -1,5 +1,17 @@
 #include "CEncoder.h"
 
+#include "alvr_server/Logger.h"
+#include "alvr_server/Settings.h"
+
+#include <chrono>
+#include <filesystem>
+#include <iomanip>
+#include <objbase.h>
+#include <sstream>
+#include <thread>
+#include <vector>
+#include <wincodec.h>
+
 CEncoder::CEncoder()
     : m_bExiting(false)
     , m_targetTimestampNs(0) {
@@ -14,6 +26,7 @@ CEncoder::~CEncoder() {
 }
 
 void CEncoder::Initialize(std::shared_ptr<CD3DRender> d3dRender) {
+    m_d3dRender = d3dRender;
     m_FrameRender = std::make_shared<FrameRender>(d3dRender);
     m_FrameRender->Startup();
     uint32_t encoderWidth, encoderHeight;
@@ -129,6 +142,14 @@ void CEncoder::Run() {
             break;
 
         if (m_FrameRender->GetTexture()) {
+            if (m_captureFrame.exchange(false)) {
+                if (auto shot = m_FrameRender->GetScreenshotTexture()) {
+                    SaveScreenshotPng(shot.Get());
+                } else {
+                    Error("Screenshot requested but no RGB texture available\n");
+                }
+            }
+
             m_videoEncoder->Transmit(
                 m_FrameRender->GetTexture().Get(),
                 m_presentationTime,
@@ -159,4 +180,161 @@ void CEncoder::OnStreamStart() { m_scheduler.OnStreamStart(); }
 
 void CEncoder::InsertIDR() { m_scheduler.InsertIDR(); }
 
-void CEncoder::CaptureFrame() { }
+void CEncoder::CaptureFrame() { m_captureFrame = true; }
+
+void CEncoder::SaveScreenshotPng(ID3D11Texture2D* texture) {
+    if (!texture || !m_d3dRender) {
+        return;
+    }
+
+    D3D11_TEXTURE2D_DESC desc {};
+    texture->GetDesc(&desc);
+
+    // Only 8-bit RGBA/BGRA family for WIC path
+    if (desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM
+        && desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+        && desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+        && desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+        Error("Screenshot: unsupported texture format %u\n", (unsigned)desc.Format);
+        return;
+    }
+
+    D3D11_TEXTURE2D_DESC stagingDesc = desc;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.MiscFlags = 0;
+
+    ComPtr<ID3D11Texture2D> staging;
+    HRESULT hr = m_d3dRender->GetDevice()->CreateTexture2D(&stagingDesc, nullptr, &staging);
+    if (FAILED(hr)) {
+        Error("Screenshot: CreateTexture2D staging failed %p\n", hr);
+        return;
+    }
+
+    m_d3dRender->GetContext()->CopyResource(staging.Get(), texture);
+
+    D3D11_MAPPED_SUBRESOURCE mapped {};
+    hr = m_d3dRender->GetContext()->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        Error("Screenshot: Map failed %p\n", hr);
+        return;
+    }
+
+    const UINT width = desc.Width;
+    const UINT height = desc.Height;
+    const UINT rowPitch = mapped.RowPitch;
+    std::vector<uint8_t> pixels(static_cast<size_t>(rowPitch) * height);
+    memcpy(pixels.data(), mapped.pData, pixels.size());
+    m_d3dRender->GetContext()->Unmap(staging.Get(), 0);
+
+    const bool isBgra = desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM
+        || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+
+    std::string dir = Settings_Instance()->m_captureFrameDir;
+    if (dir.empty()) {
+        dir = ".";
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+
+    auto now = std::chrono::system_clock::now();
+    auto t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm {};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    std::ostringstream name;
+    name << dir << "/screenshot." << std::put_time(&tm, "%Y-%m-%d.%H-%M-%S") << ".png";
+    std::wstring wpath(name.str().begin(), name.str().end());
+
+    std::thread([pixels = std::move(pixels),
+                 width,
+                 height,
+                 rowPitch,
+                 isBgra,
+                 wpath = std::move(wpath),
+                 pathUtf8 = name.str()]() {
+        HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool shouldUninit = SUCCEEDED(coHr);
+
+        auto cleanup = [&]() {
+            if (shouldUninit) {
+                CoUninitialize();
+            }
+        };
+
+        ComPtr<IWICImagingFactory> factory;
+        HRESULT hr = CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory)
+        );
+        if (FAILED(hr)) {
+            Error("Screenshot: WIC factory failed %p\n", hr);
+            cleanup();
+            return;
+        }
+
+        ComPtr<IWICStream> stream;
+        hr = factory->CreateStream(&stream);
+        if (FAILED(hr) || FAILED(stream->InitializeFromFilename(wpath.c_str(), GENERIC_WRITE))) {
+            Error("Screenshot: failed to open file %s\n", pathUtf8.c_str());
+            cleanup();
+            return;
+        }
+
+        ComPtr<IWICBitmapEncoder> encoder;
+        hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+        if (FAILED(hr) || FAILED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache))) {
+            Error("Screenshot: PNG encoder init failed\n");
+            cleanup();
+            return;
+        }
+
+        ComPtr<IWICBitmapFrameEncode> frame;
+        ComPtr<IPropertyBag2> props;
+        hr = encoder->CreateNewFrame(&frame, &props);
+        if (FAILED(hr) || FAILED(frame->Initialize(props.Get()))) {
+            Error("Screenshot: frame init failed\n");
+            cleanup();
+            return;
+        }
+
+        frame->SetSize(width, height);
+        WICPixelFormatGUID format = GUID_WICPixelFormat32bppRGBA;
+        frame->SetPixelFormat(&format);
+
+        // Convert BGRA -> RGBA if needed into tightly packed buffer
+        std::vector<uint8_t> packed(static_cast<size_t>(width) * height * 4);
+        for (UINT y = 0; y < height; ++y) {
+            const uint8_t* src = pixels.data() + static_cast<size_t>(y) * rowPitch;
+            uint8_t* dst = packed.data() + static_cast<size_t>(y) * width * 4;
+            for (UINT x = 0; x < width; ++x) {
+                if (isBgra) {
+                    dst[x * 4 + 0] = src[x * 4 + 2];
+                    dst[x * 4 + 1] = src[x * 4 + 1];
+                    dst[x * 4 + 2] = src[x * 4 + 0];
+                    dst[x * 4 + 3] = src[x * 4 + 3];
+                } else {
+                    dst[x * 4 + 0] = src[x * 4 + 0];
+                    dst[x * 4 + 1] = src[x * 4 + 1];
+                    dst[x * 4 + 2] = src[x * 4 + 2];
+                    dst[x * 4 + 3] = src[x * 4 + 3];
+                }
+            }
+        }
+
+        hr = frame->WritePixels(height, width * 4, static_cast<UINT>(packed.size()), packed.data());
+        if (FAILED(hr) || FAILED(frame->Commit()) || FAILED(encoder->Commit())) {
+            Error("Screenshot: write PNG failed for %s\n", pathUtf8.c_str());
+        } else {
+            Info("Screenshot saved: %s\n", pathUtf8.c_str());
+        }
+
+        cleanup();
+    }).detach();
+}

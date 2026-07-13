@@ -193,7 +193,7 @@ async fn insert_idr(State(ctx): State<Arc<ConnectionContext>>) {
 }
 
 async fn capture_frame(State(ctx): State<Arc<ConnectionContext>>) {
-    ctx.events_sender.send(ServerCoreEvent::CaptureFrame).ok();
+    crate::request_screenshot(&ctx);
 }
 
 async fn start_recording(State(ctx): State<Arc<ConnectionContext>>) {
@@ -201,7 +201,7 @@ async fn start_recording(State(ctx): State<Arc<ConnectionContext>>) {
 }
 
 async fn stop_recording(State(ctx): State<Arc<ConnectionContext>>) {
-    *ctx.video_recording_file.lock() = None;
+    crate::stop_recording(&ctx);
 }
 
 async fn add_firewall_rules() {

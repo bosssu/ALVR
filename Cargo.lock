@@ -409,7 +409,6 @@ dependencies = [
  "mdns-sd",
  "profiling",
  "rfd",
- "rodio",
  "rosc",
  "serde",
  "serde_json",

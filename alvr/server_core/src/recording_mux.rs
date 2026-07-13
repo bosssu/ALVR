@@ -1,26 +1,42 @@
-//! Live lossless mux of bitstream video + PCM audio into Matroska via ffmpeg.
+//! Live capture of bitstream video + PCM audio, finalized into one Matroska via ffmpeg.
 //!
-//! NALs/PCM are queued from realtime callbacks; helper threads write into OS pipes
-//! that ffmpeg reads. `-use_wallclock_as_timestamps 1` keeps A/V on wall-clock time.
+//! Realtime path only appends elementary streams to temp files (cheap, no pipe deadlocks).
+//! On stop, a background job remuxes with `-c:v copy` / PCM audio.
+//!
+//! Windows WASAPI loopback often delivers **no buffers while output is silent**. Without
+//! compensation the PCM track would start at the first audible sample and stay shorter than
+//! video. The audio writer therefore inserts s16le silence so the written sample timeline
+//! tracks wall-clock from recording start (leading silence, mid gaps, and trailing pad).
 
-use alvr_common::{error, info};
+use alvr_common::{error, info, warn};
 use std::{
-    fs,
-    io::Read,
+    fs::{self, File},
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 pub struct LiveMuxSession {
     video_tx: Option<flume::Sender<Vec<u8>>>,
     audio_tx: Option<flume::Sender<Vec<u8>>>,
     join: Option<JoinHandle<()>>,
+    stop_flag: Arc<AtomicBool>,
     output_path: PathBuf,
 }
 
 impl LiveMuxSession {
-    pub fn start(output_mkv: PathBuf, sample_rate: u32, codec_hint: &str) -> Result<Self, String> {
+    pub fn start(
+        output_mkv: PathBuf,
+        sample_rate: u32,
+        codec_hint: &str,
+        fallback_fps: f32,
+    ) -> Result<Self, String> {
         if let Some(parent) = output_mkv.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
         }
@@ -42,21 +58,31 @@ impl LiveMuxSession {
         let (audio_tx, audio_rx) = flume::unbounded::<Vec<u8>>();
         let output_path = output_mkv.clone();
         let demux_for_log = demux.clone();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_for_worker = Arc::clone(&stop_flag);
 
         let join = thread::spawn(move || {
-            if let Err(e) =
-                mux_worker(ffmpeg, output_path.clone(), sample_rate, &demux, video_rx, audio_rx)
-            {
-                error!("Live mux failed: {e}");
+            if let Err(e) = capture_and_mux_worker(
+                ffmpeg,
+                output_path.clone(),
+                sample_rate,
+                &demux,
+                fallback_fps,
+                video_rx,
+                audio_rx,
+                stop_for_worker,
+            ) {
+                error!("Recording mux failed: {e}");
             } else {
-                info!("Live MKV recording finished: {}", output_path.display());
+                info!("Recording MKV finished: {}", output_path.display());
             }
         });
 
         info!(
-            "Live MKV recording started ({} Hz, {}): {}",
+            "Recording started ({} Hz, {}, fallback {:.0} fps): {}",
             sample_rate,
             demux_for_log,
+            fallback_fps,
             output_mkv.display()
         );
 
@@ -64,6 +90,7 @@ impl LiveMuxSession {
             video_tx: Some(video_tx),
             audio_tx: Some(audio_tx),
             join: Some(join),
+            stop_flag,
             output_path: output_mkv,
         })
     }
@@ -89,7 +116,7 @@ impl LiveMuxSession {
     pub fn audio_sender(&self) -> flume::Sender<Vec<u8>> {
         self.audio_tx
             .as_ref()
-            .expect("live mux audio sender")
+            .expect("recording audio sender")
             .clone()
     }
 
@@ -97,23 +124,56 @@ impl LiveMuxSession {
         &self.output_path
     }
 
+    /// Close queues and wait for remux (may block). Prefer [`finish_async`] from hotkeys.
     pub fn finish(mut self) {
-        // Close channels so pipe writers see EOF, then wait for ffmpeg.
+        self.begin_stop();
+        if let Some(j) = self.join.take() {
+            wait_join(j, Duration::from_secs(120));
+        }
+    }
+
+    /// Non-blocking stop for the VR/hotkey path.
+    pub fn finish_async(mut self) {
+        self.begin_stop();
+        if let Some(j) = self.join.take() {
+            thread::spawn(move || {
+                wait_join(j, Duration::from_secs(120));
+            });
+        }
+    }
+
+    fn begin_stop(&mut self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        // Closing senders ends the capture threads after they drain queued data.
         self.video_tx = None;
         self.audio_tx = None;
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
     }
 }
 
 impl Drop for LiveMuxSession {
     fn drop(&mut self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
         self.video_tx = None;
         self.audio_tx = None;
         if let Some(j) = self.join.take() {
-            let _ = j.join();
+            wait_join(j, Duration::from_secs(30));
         }
+    }
+}
+
+fn wait_join(join: JoinHandle<()>, timeout: Duration) {
+    let done = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&done);
+    thread::spawn(move || {
+        let _ = join.join();
+        flag.store(true, Ordering::SeqCst);
+    });
+    let start = Instant::now();
+    while !done.load(Ordering::SeqCst) && start.elapsed() < timeout {
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !done.load(Ordering::SeqCst) {
+        warn!("Recording finalize still running after {timeout:?}");
     }
 }
 
@@ -162,280 +222,326 @@ fn find_ffmpeg() -> Option<PathBuf> {
     .find(|p| p.is_file())
 }
 
-fn mux_worker(
+/// Stereo s16le frame size.
+const PCM_FRAME_BYTES: u64 = 4;
+
+fn wall_pcm_bytes(started: Instant, sample_rate: u32) -> u64 {
+    let frames = (started.elapsed().as_secs_f64() * f64::from(sample_rate)).round() as u64;
+    frames * PCM_FRAME_BYTES
+}
+
+fn write_silence(file: &mut File, mut nbytes: u64) -> Result<(), String> {
+    // Keep PCM frame-aligned.
+    nbytes -= nbytes % PCM_FRAME_BYTES;
+    if nbytes == 0 {
+        return Ok(());
+    }
+    // Reuse a modest zero buffer instead of allocating multi‑second vectors.
+    let chunk = vec![0u8; 16 * 1024];
+    let mut left = nbytes;
+    while left > 0 {
+        let n = left.min(chunk.len() as u64) as usize;
+        file.write_all(&chunk[..n])
+            .map_err(|e| format!("write silence: {e}"))?;
+        left -= n as u64;
+    }
+    Ok(())
+}
+
+/// Ensure written PCM reaches at least `target_bytes` by inserting silence.
+fn pad_audio_to(
+    file: &mut File,
+    written: &mut u64,
+    silence_padded: &mut u64,
+    target_bytes: u64,
+) -> Result<(), String> {
+    let target = target_bytes - (target_bytes % PCM_FRAME_BYTES);
+    if target <= *written {
+        return Ok(());
+    }
+    let gap = target - *written;
+    write_silence(file, gap)?;
+    *written += gap;
+    *silence_padded += gap;
+    Ok(())
+}
+
+fn capture_and_mux_worker(
     ffmpeg: PathBuf,
     output_mkv: PathBuf,
     sample_rate: u32,
     demux: &str,
+    fallback_fps: f32,
     video_rx: flume::Receiver<Vec<u8>>,
     audio_rx: flume::Receiver<Vec<u8>>,
+    _stop_flag: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        mux_worker_windows(ffmpeg, output_mkv, sample_rate, demux, video_rx, audio_rx)
-    }
-    #[cfg(not(windows))]
-    {
-        mux_worker_unix(ffmpeg, output_mkv, sample_rate, demux, video_rx, audio_rx)
-    }
-}
+    let started = Instant::now();
 
-fn spawn_ffmpeg(
-    ffmpeg: &Path,
-    output_mkv: &Path,
-    sample_rate: u32,
-    demux: &str,
-    video_input: &str,
-    audio_input: &str,
-) -> Result<Child, String> {
-    Command::new(ffmpeg)
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-y")
-        .arg("-thread_queue_size")
-        .arg("1024")
-        .arg("-use_wallclock_as_timestamps")
-        .arg("1")
-        .arg("-f")
-        .arg(demux)
-        .arg("-i")
-        .arg(video_input)
-        .arg("-thread_queue_size")
-        .arg("1024")
-        .arg("-use_wallclock_as_timestamps")
-        .arg("1")
-        .arg("-f")
-        .arg("s16le")
-        .arg("-ar")
-        .arg(sample_rate.to_string())
-        .arg("-ac")
-        .arg("2")
-        .arg("-i")
-        .arg(audio_input)
-        .arg("-c:v")
-        .arg("copy")
-        .arg("-c:a")
-        .arg("pcm_s16le")
-        .arg(output_mkv.as_os_str())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn ffmpeg ({}): {e}", ffmpeg.display()))
-}
+    let video_tmp = output_mkv.with_extension("video.tmp");
+    let audio_tmp = output_mkv.with_extension("audio.tmp");
+    let _ = fs::remove_file(&video_tmp);
+    let _ = fs::remove_file(&audio_tmp);
 
-fn finish_ffmpeg(mut child: Child) -> Result<(), String> {
-    let mut err_text = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_string(&mut err_text);
-    }
-    match child.wait() {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => {
-            let msg = err_text.trim();
-            if msg.is_empty() {
-                Err(format!("ffmpeg exit {status}"))
-            } else {
-                Err(format!("ffmpeg exit {status}: {msg}"))
+    let mut video_file =
+        File::create(&video_tmp).map_err(|e| format!("create video temp: {e}"))?;
+    let mut audio_file =
+        File::create(&audio_tmp).map_err(|e| format!("create audio temp: {e}"))?;
+
+    let video_bytes = Arc::new(AtomicU64::new(0));
+    let audio_bytes = Arc::new(AtomicU64::new(0));
+    let audio_silence = Arc::new(AtomicU64::new(0));
+    let video_packets = Arc::new(AtomicU64::new(0));
+
+    let vb = Arc::clone(&video_bytes);
+    let vp = Arc::clone(&video_packets);
+    let v_thread = thread::spawn(move || -> Result<(), String> {
+        while let Ok(chunk) = video_rx.recv() {
+            video_file
+                .write_all(&chunk)
+                .map_err(|e| format!("write video temp: {e}"))?;
+            vb.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            vp.fetch_add(1, Ordering::Relaxed);
+        }
+        video_file
+            .flush()
+            .map_err(|e| format!("flush video temp: {e}"))?;
+        Ok(())
+    });
+
+    let ab = Arc::clone(&audio_bytes);
+    let asil = Arc::clone(&audio_silence);
+    let a_thread = thread::spawn(move || -> Result<(), String> {
+        let mut written = 0u64;
+        let mut silence_padded = 0u64;
+
+        // Drain real samples; before each chunk, fill any wall-clock gap with silence
+        // (covers silent start + mid-session loopback gaps).
+        loop {
+            match audio_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(chunk) => {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    pad_audio_to(
+                        &mut audio_file,
+                        &mut written,
+                        &mut silence_padded,
+                        wall_pcm_bytes(started, sample_rate),
+                    )?;
+                    audio_file
+                        .write_all(&chunk)
+                        .map_err(|e| format!("write audio temp: {e}"))?;
+                    written += chunk.len() as u64;
+                }
+                Err(flume::RecvTimeoutError::Timeout) => {
+                    // Keep the PCM timeline advancing during long silence so stop-time
+                    // padding is small and the file stays aligned if inspected mid-record.
+                    pad_audio_to(
+                        &mut audio_file,
+                        &mut written,
+                        &mut silence_padded,
+                        wall_pcm_bytes(started, sample_rate),
+                    )?;
+                }
+                Err(flume::RecvTimeoutError::Disconnected) => break,
             }
         }
-        Err(e) => Err(format!("ffmpeg wait: {e}")),
-    }
-}
 
-#[cfg(windows)]
-fn mux_worker_windows(
-    ffmpeg: PathBuf,
-    output_mkv: PathBuf,
-    sample_rate: u32,
-    demux: &str,
-    video_rx: flume::Receiver<Vec<u8>>,
-    audio_rx: flume::Receiver<Vec<u8>>,
-) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::Storage::FileSystem::WriteFile;
-    use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
-    use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-        PIPE_TYPE_BYTE, PIPE_WAIT,
+        // Trailing silence through stop (channel closed).
+        pad_audio_to(
+            &mut audio_file,
+            &mut written,
+            &mut silence_padded,
+            wall_pcm_bytes(started, sample_rate),
+        )?;
+
+        audio_file
+            .flush()
+            .map_err(|e| format!("flush audio temp: {e}"))?;
+        ab.store(written, Ordering::Relaxed);
+        asil.store(silence_padded, Ordering::Relaxed);
+        Ok(())
+    });
+
+    let v_res = v_thread
+        .join()
+        .map_err(|_| "video writer panicked".to_string())?;
+    let a_res = a_thread
+        .join()
+        .map_err(|_| "audio writer panicked".to_string())?;
+    v_res?;
+    a_res?;
+
+    let wall = started.elapsed();
+    let v_bytes = video_bytes.load(Ordering::Relaxed);
+    let a_bytes = audio_bytes.load(Ordering::Relaxed);
+    let a_silence = audio_silence.load(Ordering::Relaxed);
+    let packets = video_packets.load(Ordering::Relaxed);
+
+    let audio_secs = a_bytes as f64 / (f64::from(sample_rate) * PCM_FRAME_BYTES as f64);
+    let silence_secs = a_silence as f64 / (f64::from(sample_rate) * PCM_FRAME_BYTES as f64);
+
+    info!(
+        "Recording capture done: {:.2}s wall, {} video packets / {} bytes, audio {:.2}s ({} bytes, {:.2}s silence padded)",
+        wall.as_secs_f64(),
+        packets,
+        v_bytes,
+        audio_secs,
+        a_bytes,
+        silence_secs
+    );
+
+    if v_bytes == 0 && a_bytes == 0 {
+        let _ = fs::remove_file(&video_tmp);
+        let _ = fs::remove_file(&audio_tmp);
+        return Err("no video or audio data captured".into());
+    }
+
+    // Prefer matching video timeline to the (now wall-aligned) audio length when present.
+    let timeline = if a_bytes > 0 {
+        Duration::from_secs_f64(audio_secs.max(0.05))
+    } else {
+        wall
     };
-    // winbase.h PIPE_ACCESS_OUTBOUND
-    const PIPE_ACCESS_OUTBOUND: FILE_FLAGS_AND_ATTRIBUTES = FILE_FLAGS_AND_ATTRIBUTES(0x00000002);
-
-    let id = std::process::id();
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let vid_name = format!(r"\\.\pipe\alvr_rec_v_{id}_{stamp}");
-    let aud_name = format!(r"\\.\pipe\alvr_rec_a_{id}_{stamp}");
-
-    unsafe fn make_pipe(name: &str) -> Result<HANDLE, String> {
-        let wide: Vec<u16> = std::ffi::OsStr::new(name)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let h = unsafe {
-            CreateNamedPipeW(
-                PCWSTR(wide.as_ptr()),
-                PIPE_ACCESS_OUTBOUND,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                1,
-                1 << 20,
-                1 << 20,
-                0,
-                None,
-            )
-        };
-        if h.is_invalid() {
-            Err(format!(
-                "CreateNamedPipeW({name}): {}",
-                std::io::Error::last_os_error()
-            ))
-        } else {
-            Ok(h)
-        }
-    }
-
-    let vid_handle = unsafe { make_pipe(&vid_name)? };
-    let aud_handle = unsafe { make_pipe(&aud_name)? };
-
-    let child = spawn_ffmpeg(
+    let fps = compute_fps(packets, timeline, fallback_fps);
+    let result = run_ffmpeg_mux(
         &ffmpeg,
         &output_mkv,
-        sample_rate,
+        &video_tmp,
+        &audio_tmp,
         demux,
-        &vid_name,
-        &aud_name,
-    )?;
+        sample_rate,
+        fps,
+        v_bytes > 0,
+        a_bytes > 0,
+    );
 
-    let connect = |h: HANDLE, label: &str| -> Result<(), String> {
-        let r = unsafe { ConnectNamedPipe(h, None) };
-        if r.is_err() {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(535) {
-                return Err(format!("ConnectNamedPipe({label}): {err}"));
-            }
-        }
-        Ok(())
-    };
-    // HANDLE is not Send in windows-rs; opaque wrapper for pipe threads.
-    struct SendHandle(HANDLE);
-    unsafe impl Send for SendHandle {}
+    let _ = fs::remove_file(&video_tmp);
+    let _ = fs::remove_file(&audio_tmp);
 
-    // Connect sequentially. ffmpeg typically opens inputs in CLI order (video then audio).
-    // If this blocks forever, check that ffmpeg is running and paths match.
-    connect(vid_handle, "video")?;
-    connect(aud_handle, "audio")?;
+    result
+}
 
-    let write_loop = |sh: SendHandle, rx: flume::Receiver<Vec<u8>>| {
-        let handle = sh.0;
-        while let Ok(chunk) = rx.recv() {
-            let mut off = 0usize;
-            while off < chunk.len() {
-                let mut written = 0u32;
-                let ok = unsafe { WriteFile(handle, Some(&chunk[off..]), Some(&mut written), None) };
-                if ok.is_err() || written == 0 {
-                    unsafe {
-                        let _ = CloseHandle(handle);
-                    }
-                    return;
-                }
-                off += written as usize;
-            }
-        }
-        unsafe {
-            let _ = CloseHandle(handle);
-        }
+fn compute_fps(video_packets: u64, wall: Duration, fallback_fps: f32) -> f32 {
+    let wall_s = wall.as_secs_f64();
+    let fallback = if fallback_fps.is_finite() && fallback_fps >= 1.0 {
+        fallback_fps
+    } else {
+        72.0
     };
 
-    let vh = SendHandle(vid_handle);
-    let ah = SendHandle(aud_handle);
-    let v_thread = thread::spawn(move || write_loop(vh, video_rx));
-    let a_thread = thread::spawn(move || write_loop(ah, audio_rx));
-    let _ = v_thread.join();
-    let _ = a_thread.join();
+    // Prefer packet count over wall clock so container duration ≈ session length.
+    // Subtract a little for the SPS/PPS config packet when present.
+    let frames = if video_packets > 1 {
+        video_packets as f64
+    } else {
+        video_packets as f64
+    };
 
+    if frames >= 2.0 && wall_s >= 0.05 {
+        let fps = frames / wall_s;
+        // Sanity clamp — ALVR is typically 60–120 Hz, allow some margin.
+        if (15.0..=240.0).contains(&fps) {
+            return fps as f32;
+        }
+    }
+    fallback
+}
+
+fn run_ffmpeg_mux(
+    ffmpeg: &Path,
+    output_mkv: &Path,
+    video_tmp: &Path,
+    audio_tmp: &Path,
+    demux: &str,
+    sample_rate: u32,
+    fps: f32,
+    has_video: bool,
+    has_audio: bool,
+) -> Result<(), String> {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y");
+
+    if has_video {
+        cmd.arg("-fflags")
+            .arg("+genpts")
+            .arg("-f")
+            .arg(demux)
+            .arg("-framerate")
+            .arg(format!("{fps:.3}"))
+            .arg("-i")
+            .arg(video_tmp.as_os_str());
+    }
+
+    if has_audio {
+        cmd.arg("-f")
+            .arg("s16le")
+            .arg("-ar")
+            .arg(sample_rate.to_string())
+            .arg("-ac")
+            .arg("2")
+            .arg("-i")
+            .arg(audio_tmp.as_os_str());
+    }
+
+    if has_video {
+        cmd.arg("-c:v").arg("copy");
+    }
+    if has_audio {
+        // Lossless PCM in MKV (same idea as previous live path).
+        cmd.arg("-c:a").arg("pcm_s16le");
+    }
+
+    // Keep both full streams; do not cut to the shorter one.
+    cmd.arg(output_mkv.as_os_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    info!(
+        "Remuxing with ffmpeg ({demux}, {fps:.2} fps, audio={has_audio}): {}",
+        output_mkv.display()
+    );
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn ffmpeg ({}): {e}", ffmpeg.display()))?;
     finish_ffmpeg(child)
 }
 
-#[cfg(not(windows))]
-fn mux_worker_unix(
-    ffmpeg: PathBuf,
-    output_mkv: PathBuf,
-    sample_rate: u32,
-    demux: &str,
-    video_rx: flume::Receiver<Vec<u8>>,
-    audio_rx: flume::Receiver<Vec<u8>>,
-) -> Result<(), String> {
-    let id = std::process::id();
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir();
-    let vid_path = dir.join(format!("alvr_rec_v_{id}_{stamp}"));
-    let aud_path = dir.join(format!("alvr_rec_a_{id}_{stamp}"));
-    let _ = fs::remove_file(&vid_path);
-    let _ = fs::remove_file(&aud_path);
+fn finish_ffmpeg(mut child: Child) -> Result<(), String> {
+    let stderr_handle = child.stderr.take().map(|mut stderr| {
+        thread::spawn(move || {
+            let mut err_text = String::new();
+            let _ = stderr.read_to_string(&mut err_text);
+            err_text
+        })
+    });
 
-    for p in [&vid_path, &aud_path] {
-        let status = Command::new("mkfifo")
-            .arg(p)
-            .status()
-            .map_err(|e| format!("mkfifo: {e}"))?;
-        if !status.success() {
-            return Err(format!("mkfifo failed for {}", p.display()));
+    let status = child.wait().map_err(|e| format!("ffmpeg wait: {e}"))?;
+    let err_text = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    if status.success() {
+        Ok(())
+    } else {
+        let msg = err_text.trim();
+        if msg.is_empty() {
+            Err(format!("ffmpeg exit {status}"))
+        } else {
+            Err(format!("ffmpeg exit {status}: {msg}"))
         }
     }
-
-    let child = spawn_ffmpeg(
-        &ffmpeg,
-        &output_mkv,
-        sample_rate,
-        demux,
-        &vid_path.to_string_lossy(),
-        &aud_path.to_string_lossy(),
-    )?;
-
-    let vp = vid_path.clone();
-    let ap = aud_path.clone();
-    let v_open = thread::spawn(move || fs::OpenOptions::new().write(true).open(vp));
-    let a_open = thread::spawn(move || fs::OpenOptions::new().write(true).open(ap));
-
-    let mut vid_w = v_open
-        .join()
-        .map_err(|_| "vid join".to_string())?
-        .map_err(|e| format!("open vid fifo: {e}"))?;
-    let mut aud_w = a_open
-        .join()
-        .map_err(|_| "aud join".to_string())?
-        .map_err(|e| format!("open aud fifo: {e}"))?;
-
-    let v_thread = thread::spawn(move || {
-        while let Ok(chunk) = video_rx.recv() {
-            if vid_w.write_all(&chunk).is_err() {
-                break;
-            }
-        }
-        let _ = vid_w.flush();
-    });
-    let a_thread = thread::spawn(move || {
-        while let Ok(chunk) = audio_rx.recv() {
-            if aud_w.write_all(&chunk).is_err() {
-                break;
-            }
-        }
-        let _ = aud_w.flush();
-    });
-
-    let _ = v_thread.join();
-    let _ = a_thread.join();
-    let res = finish_ffmpeg(child);
-    let _ = fs::remove_file(&vid_path);
-    let _ = fs::remove_file(&aud_path);
-    res
 }

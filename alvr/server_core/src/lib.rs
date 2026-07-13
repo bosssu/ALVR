@@ -161,8 +161,9 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
         .game_audio_sample_rate
         .load(Ordering::Relaxed);
     let sample_rate = if sample_rate == 0 { 48000 } else { sample_rate };
+    let fallback_fps = settings.video.preferred_fps;
 
-    match recording_mux::LiveMuxSession::start(output_mkv, sample_rate, codec_hint) {
+    match recording_mux::LiveMuxSession::start(output_mkv, sample_rate, codec_hint, fallback_fps) {
         Ok(session) => {
             if let Some(config) = &*connection_context.decoder_config.lock() {
                 session.push_video(&config.config_buffer);
@@ -176,7 +177,7 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
                 .ok();
         }
         Err(e) => {
-            error!("Failed to start live MKV recording: {e}");
+            error!("Failed to start MKV recording: {e}");
         }
     }
 }
@@ -190,8 +191,8 @@ pub fn stop_recording_with_feedback(connection_context: &ConnectionContext, play
 
     *connection_context.audio_tee_tx.lock() = None;
     if let Some(session) = connection_context.live_recording.lock().take() {
-        // finish() joins ffmpeg — may take a moment to flush the container.
-        session.finish();
+        // Never block the hotkey / SteamVR path on ffmpeg flush — finish in background.
+        session.finish_async();
     }
 
     if play_sound && was_recording {

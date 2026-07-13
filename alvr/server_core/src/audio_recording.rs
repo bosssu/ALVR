@@ -1,9 +1,16 @@
-use alvr_common::anyhow::{Context, Result};
+use alvr_common::{
+    anyhow::{Context, Result},
+    parking_lot::Mutex as ParkingMutex,
+};
 use std::{
     fs::File,
     io::{Seek, SeekFrom, Write},
     path::PathBuf,
-    time::{Duration, Instant},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread::{self, JoinHandle},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,16 +20,17 @@ pub enum AudioRecState {
     Recording,
 }
 
-/// Writes a PCM s16le WAV, opened only after the first video bytes are written (A/V start align).
+/// PCM s16le WAV writer. Loopback samples are queued (never block the audio callback);
+/// a dedicated thread writes the file so video-path locks cannot drop audio.
 pub struct AudioRecordingWriter {
     state: AudioRecState,
     stem: Option<PathBuf>,
     sample_rate: u32,
     channels: u16,
-    file: Option<File>,
-    data_bytes: u32,
-    /// Drop loopback samples until this instant (keeps feedback beeps out of the WAV).
-    mute_until: Option<Instant>,
+    /// True while Armed and waiting for first video bytes to open the WAV.
+    pending_open: Arc<AtomicBool>,
+    pcm_tx: Option<flume::Sender<Vec<u8>>>,
+    writer_join: Option<JoinHandle<Result<u32>>>,
 }
 
 impl Default for AudioRecordingWriter {
@@ -38,9 +46,9 @@ impl AudioRecordingWriter {
             stem: None,
             sample_rate: 48000,
             channels: 2,
-            file: None,
-            data_bytes: 0,
-            mute_until: None,
+            pending_open: Arc::new(AtomicBool::new(false)),
+            pcm_tx: None,
+            writer_join: None,
         }
     }
 
@@ -48,24 +56,19 @@ impl AudioRecordingWriter {
         self.state
     }
 
-    /// Drop game-audio samples for a short window (e.g. while playing a feedback beep).
-    pub fn mute_for(&mut self, duration: Duration) {
-        let until = Instant::now() + duration;
-        self.mute_until = Some(match self.mute_until {
-            Some(prev) if prev > until => prev,
-            _ => until,
-        });
+    /// Cheap check for the video path: only take the audio mutex when this is true.
+    pub fn needs_video_open(&self) -> bool {
+        self.pending_open.load(Ordering::Acquire)
     }
 
-    /// Prepare to record; WAV file is created only on first video write.
+    /// Prepare to record; WAV is created on first video write.
     pub fn arm(&mut self, stem: PathBuf, sample_rate: u32, channels: u16) {
         let _ = self.finalize();
         self.stem = Some(stem);
         self.sample_rate = sample_rate.max(1);
         self.channels = channels.max(1);
         self.state = AudioRecState::Armed;
-        self.data_bytes = 0;
-        self.mute_until = None;
+        self.pending_open.store(true, Ordering::Release);
     }
 
     pub fn on_video_bytes_written(&mut self) -> Result<()> {
@@ -80,39 +83,62 @@ impl AudioRecordingWriter {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
         let mut file = File::create(&path)?;
         write_wav_header_placeholder(&mut file, self.sample_rate, self.channels)?;
-        self.file = Some(file);
+
+        let (tx, rx) = flume::unbounded::<Vec<u8>>();
+        let join = thread::spawn(move || -> Result<u32> {
+            let mut data_bytes: u32 = 0;
+            while let Ok(chunk) = rx.recv() {
+                file.write_all(&chunk)?;
+                data_bytes = data_bytes.saturating_add(chunk.len() as u32);
+            }
+            // Channel closed: patch sizes before file drops.
+            patch_wav_sizes(&mut file, data_bytes)?;
+            file.flush()?;
+            Ok(data_bytes)
+        });
+
+        self.pcm_tx = Some(tx);
+        self.writer_join = Some(join);
         self.state = AudioRecState::Recording;
+        self.pending_open.store(false, Ordering::Release);
         Ok(())
     }
 
-    pub fn write_pcm_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+    /// Non-blocking: queue samples for the writer thread. Safe to call from WASAPI/cpal callback.
+    pub fn write_pcm_bytes(&mut self, bytes: &[u8]) {
         if self.state != AudioRecState::Recording {
-            return Ok(());
+            return;
         }
-        if let Some(until) = self.mute_until {
-            if Instant::now() < until {
-                return Ok(());
-            }
-            self.mute_until = None;
+        if let Some(tx) = &self.pcm_tx {
+            // Unbounded queue — never blocks the audio callback.
+            let _ = tx.send(bytes.to_vec());
         }
-        if let Some(file) = self.file.as_mut() {
-            file.write_all(bytes)?;
-            self.data_bytes = self.data_bytes.saturating_add(bytes.len() as u32);
-        }
-        Ok(())
     }
 
     pub fn finalize(&mut self) -> Result<()> {
-        if let Some(mut file) = self.file.take() {
-            patch_wav_sizes(&mut file, self.data_bytes)?;
-        } else if self.state == AudioRecState::Armed {
-            // Never opened — nothing on disk
+        self.pending_open.store(false, Ordering::Release);
+        // Drop sender so writer thread exits and patches the header.
+        self.pcm_tx = None;
+        if let Some(join) = self.writer_join.take() {
+            match join.join() {
+                Ok(Ok(_bytes)) => {}
+                Ok(Err(e)) => {
+                    self.stem = None;
+                    self.state = AudioRecState::Idle;
+                    return Err(e);
+                }
+                Err(_) => {
+                    self.stem = None;
+                    self.state = AudioRecState::Idle;
+                    alvr_common::error!("Audio recording writer thread panicked");
+                }
+            }
         }
         self.stem = None;
         self.state = AudioRecState::Idle;
-        self.data_bytes = 0;
         Ok(())
     }
 }
@@ -146,6 +172,24 @@ fn patch_wav_sizes(file: &mut File, data_bytes: u32) -> Result<()> {
     Ok(())
 }
 
+/// Shared flag for video path without taking the full writer lock every frame.
+pub fn note_video_if_pending(writer: &ParkingMutex<AudioRecordingWriter>) {
+    // Fast path: no open pending.
+    let pending = {
+        let w = writer.lock();
+        if !w.needs_video_open() {
+            return;
+        }
+        true
+    };
+    if !pending {
+        return;
+    }
+    if let Err(e) = writer.lock().on_video_bytes_written() {
+        alvr_common::error!("Failed to open recording WAV: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,14 +203,15 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let stem = dir.join("recording.test");
+        let stem = dir.join("recording_test");
         let mut w = AudioRecordingWriter::new();
         w.arm(stem.clone(), 48000, 2);
         assert_eq!(w.state(), AudioRecState::Armed);
+        assert!(w.needs_video_open());
         w.on_video_bytes_written().unwrap();
         assert_eq!(w.state(), AudioRecState::Recording);
-        // two stereo frames
-        w.write_pcm_bytes(&[0, 0, 0, 0, 100, 0, 156, 255]).unwrap();
+        assert!(!w.needs_video_open());
+        w.write_pcm_bytes(&[0, 0, 0, 0, 100, 0, 156, 255]);
         w.finalize().unwrap();
         let mut f = File::open(crate::capture_paths::with_media_ext(&stem, "wav")).unwrap();
         let mut hdr = [0u8; 12];
@@ -187,7 +232,7 @@ mod tests {
     #[test]
     fn write_while_idle_is_noop() {
         let mut w = AudioRecordingWriter::new();
-        w.write_pcm_bytes(&[1, 2, 3, 4]).unwrap();
+        w.write_pcm_bytes(&[1, 2, 3, 4]);
         assert_eq!(w.state(), AudioRecState::Idle);
     }
 }

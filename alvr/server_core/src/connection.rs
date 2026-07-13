@@ -938,7 +938,8 @@ fn connection_pipeline(
                     let tee = {
                         let ctx = Arc::clone(&ctx);
                         Some(Box::new(move |bytes: &[u8]| {
-                            let _ = ctx.audio_recording.lock().write_pcm_bytes(bytes);
+                            // Queue to writer thread; hold lock only long enough to send.
+                            ctx.audio_recording.lock().write_pcm_bytes(bytes);
                         })
                             as Box<dyn FnMut(&[u8]) + Send>)
                     };

@@ -127,18 +127,18 @@ pub struct ConnectionContext {
 }
 
 fn note_video_recording_bytes(connection_context: &ConnectionContext) {
-    if let Err(e) = connection_context
-        .audio_recording
-        .lock()
-        .on_video_bytes_written()
-    {
-        error!("Failed to open recording WAV: {e}");
-    }
+    // Only locks when a WAV open is still pending (first video bytes after arm).
+    audio_recording::note_video_if_pending(&connection_context.audio_recording);
 }
 
 pub fn create_recording_file(connection_context: &ConnectionContext, settings: &Settings) {
-    // Always use .mp4 as the on-disk extension. Payload remains the live encoder bitstream
-    // (H264/HEVC/AV1 elementary). Pair with the sibling .wav and remux for playback.
+    let codec = settings.video.preferred_codec;
+    let ext = match codec {
+        CodecType::H264 => "h264",
+        CodecType::Hevc => "h265",
+        CodecType::AV1 => "av1",
+    };
+
     let root = capture_paths::program_root();
     let dir = capture_paths::resolve_capture_path(&root, &settings.extra.capture.recording_dir);
     if let Err(e) = capture_paths::ensure_dir(&dir) {
@@ -147,7 +147,13 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
     }
 
     let stem = dir.join(capture_paths::recording_stem(chrono::Local::now()));
-    let video_path = capture_paths::with_media_ext(&stem, "mp4");
+    let video_path = capture_paths::with_media_ext(&stem, ext);
+
+    // Play start tone before arming capture so most of the beep is outside the WAV.
+    connection_context.feedback_sounds.play(
+        feedback_sounds::FeedbackKind::RecStart,
+        settings.extra.capture.feedback_sounds_enabled,
+    );
 
     match File::create(&video_path) {
         Ok(mut file) => {
@@ -162,14 +168,10 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
 
             let sample_rate = *connection_context.game_audio_sample_rate.lock();
             let sample_rate = if sample_rate == 0 { 48000 } else { sample_rate };
-            {
-                let mut audio = connection_context.audio_recording.lock();
-                audio.arm(stem, sample_rate, 2);
-                // Keep start beep (and a bit of tail) out of the WAV via loopback mute window.
-                if settings.extra.capture.feedback_sounds_enabled {
-                    audio.mute_for(std::time::Duration::from_millis(250));
-                }
-            }
+            connection_context
+                .audio_recording
+                .lock()
+                .arm(stem, sample_rate, 2);
 
             if wrote_config {
                 note_video_recording_bytes(connection_context);
@@ -179,12 +181,6 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
                 .events_sender
                 .send(ServerCoreEvent::RequestIDR)
                 .ok();
-
-            // Play after arm + mute so the tone is heard but not captured.
-            connection_context.feedback_sounds.play(
-                feedback_sounds::FeedbackKind::RecStart,
-                settings.extra.capture.feedback_sounds_enabled,
-            );
         }
         Err(e) => {
             error!("Failed to record video on disk: {e}");
@@ -230,22 +226,11 @@ pub fn resolved_screenshot_dir(settings: &Settings) -> PathBuf {
 
 pub fn request_screenshot(connection_context: &ConnectionContext) {
     let settings = SESSION_MANAGER.read().settings().clone();
-    if settings.extra.capture.feedback_sounds_enabled {
-        // If a recording is active, suppress loopback long enough to cover the beep.
-        if !matches!(
-            connection_context.audio_recording.lock().state(),
-            audio_recording::AudioRecState::Idle
-        ) {
-            connection_context
-                .audio_recording
-                .lock()
-                .mute_for(std::time::Duration::from_millis(200));
-        }
-        connection_context.feedback_sounds.play(
-            feedback_sounds::FeedbackKind::Screenshot,
-            true,
-        );
-    }
+    // No loopback mute: muting dropped real game audio and shortened the WAV vs video.
+    connection_context.feedback_sounds.play(
+        feedback_sounds::FeedbackKind::Screenshot,
+        settings.extra.capture.feedback_sounds_enabled,
+    );
     connection_context
         .events_sender
         .send(ServerCoreEvent::CaptureFrame)
@@ -503,10 +488,16 @@ impl ServerCoreContext {
             sender.send(config_buffer.clone()).ok();
         }
 
-        if let Some(file) = &mut *self.connection_context.video_recording_file.lock() {
-            if file.write_all(&config_buffer).is_ok() {
-                note_video_recording_bytes(&self.connection_context);
-            }
+        let wrote_recording = if let Some(file) =
+            &mut *self.connection_context.video_recording_file.lock()
+        {
+            file.write_all(&config_buffer).is_ok()
+        } else {
+            false
+        };
+        // Release video file lock before touching audio recording.
+        if wrote_recording {
+            note_video_recording_bytes(&self.connection_context);
         }
 
         *self.connection_context.decoder_config.lock() = Some(DecoderInitializationConfig {
@@ -571,10 +562,15 @@ impl ServerCoreContext {
                     sender.send(nal_buffer.clone()).ok();
                 }
 
-                if let Some(file) = &mut *self.connection_context.video_recording_file.lock() {
-                    if file.write_all(&nal_buffer).is_ok() {
-                        note_video_recording_bytes(&self.connection_context);
-                    }
+                let wrote_recording = if let Some(file) =
+                    &mut *self.connection_context.video_recording_file.lock()
+                {
+                    file.write_all(&nal_buffer).is_ok()
+                } else {
+                    false
+                };
+                if wrote_recording {
+                    note_video_recording_bytes(&self.connection_context);
                 }
 
                 let sender_result = sender.try_send(VideoPacket {

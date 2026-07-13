@@ -3,6 +3,7 @@ use std::{
     fs::File,
     io::{Seek, SeekFrom, Write},
     path::PathBuf,
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +21,8 @@ pub struct AudioRecordingWriter {
     channels: u16,
     file: Option<File>,
     data_bytes: u32,
+    /// Drop loopback samples until this instant (keeps feedback beeps out of the WAV).
+    mute_until: Option<Instant>,
 }
 
 impl Default for AudioRecordingWriter {
@@ -37,11 +40,21 @@ impl AudioRecordingWriter {
             channels: 2,
             file: None,
             data_bytes: 0,
+            mute_until: None,
         }
     }
 
     pub fn state(&self) -> AudioRecState {
         self.state
+    }
+
+    /// Drop game-audio samples for a short window (e.g. while playing a feedback beep).
+    pub fn mute_for(&mut self, duration: Duration) {
+        let until = Instant::now() + duration;
+        self.mute_until = Some(match self.mute_until {
+            Some(prev) if prev > until => prev,
+            _ => until,
+        });
     }
 
     /// Prepare to record; WAV file is created only on first video write.
@@ -52,6 +65,7 @@ impl AudioRecordingWriter {
         self.channels = channels.max(1);
         self.state = AudioRecState::Armed;
         self.data_bytes = 0;
+        self.mute_until = None;
     }
 
     pub fn on_video_bytes_written(&mut self) -> Result<()> {
@@ -61,7 +75,7 @@ impl AudioRecordingWriter {
         let path = self
             .stem
             .as_ref()
-            .map(|s| s.with_extension("wav"))
+            .map(|s| crate::capture_paths::with_media_ext(s, "wav"))
             .context("no recording stem")?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -76,6 +90,12 @@ impl AudioRecordingWriter {
     pub fn write_pcm_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         if self.state != AudioRecState::Recording {
             return Ok(());
+        }
+        if let Some(until) = self.mute_until {
+            if Instant::now() < until {
+                return Ok(());
+            }
+            self.mute_until = None;
         }
         if let Some(file) = self.file.as_mut() {
             file.write_all(bytes)?;
@@ -148,7 +168,7 @@ mod tests {
         // two stereo frames
         w.write_pcm_bytes(&[0, 0, 0, 0, 100, 0, 156, 255]).unwrap();
         w.finalize().unwrap();
-        let mut f = File::open(stem.with_extension("wav")).unwrap();
+        let mut f = File::open(crate::capture_paths::with_media_ext(&stem, "wav")).unwrap();
         let mut hdr = [0u8; 12];
         f.read_exact(&mut hdr).unwrap();
         assert_eq!(&hdr[0..4], b"RIFF");

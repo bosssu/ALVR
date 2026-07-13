@@ -152,7 +152,7 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
     }
 
     let stem = dir.join(capture_paths::recording_stem(chrono::Local::now()));
-    let video_path = stem.with_extension(ext);
+    let video_path = capture_paths::with_media_ext(&stem, ext);
 
     match File::create(&video_path) {
         Ok(mut file) => {
@@ -167,10 +167,14 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
 
             let sample_rate = *connection_context.game_audio_sample_rate.lock();
             let sample_rate = if sample_rate == 0 { 48000 } else { sample_rate };
-            connection_context
-                .audio_recording
-                .lock()
-                .arm(stem, sample_rate, 2);
+            {
+                let mut audio = connection_context.audio_recording.lock();
+                audio.arm(stem, sample_rate, 2);
+                // Keep start beep (and a bit of tail) out of the WAV via loopback mute window.
+                if settings.extra.capture.feedback_sounds_enabled {
+                    audio.mute_for(std::time::Duration::from_millis(250));
+                }
+            }
 
             if wrote_config {
                 note_video_recording_bytes(connection_context);
@@ -181,6 +185,7 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
                 .send(ServerCoreEvent::RequestIDR)
                 .ok();
 
+            // Play after arm + mute so the tone is heard but not captured.
             connection_context.feedback_sounds.play(
                 feedback_sounds::FeedbackKind::RecStart,
                 settings.extra.capture.feedback_sounds_enabled,
@@ -230,10 +235,22 @@ pub fn resolved_screenshot_dir(settings: &Settings) -> PathBuf {
 
 pub fn request_screenshot(connection_context: &ConnectionContext) {
     let settings = SESSION_MANAGER.read().settings().clone();
-    connection_context.feedback_sounds.play(
-        feedback_sounds::FeedbackKind::Screenshot,
-        settings.extra.capture.feedback_sounds_enabled,
-    );
+    if settings.extra.capture.feedback_sounds_enabled {
+        // If a recording is active, suppress loopback long enough to cover the beep.
+        if !matches!(
+            connection_context.audio_recording.lock().state(),
+            audio_recording::AudioRecState::Idle
+        ) {
+            connection_context
+                .audio_recording
+                .lock()
+                .mute_for(std::time::Duration::from_millis(200));
+        }
+        connection_context.feedback_sounds.play(
+            feedback_sounds::FeedbackKind::Screenshot,
+            true,
+        );
+    }
     connection_context
         .events_sender
         .send(ServerCoreEvent::CaptureFrame)

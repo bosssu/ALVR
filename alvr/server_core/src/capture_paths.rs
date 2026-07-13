@@ -24,8 +24,20 @@ pub fn program_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Base name without extension. Use underscores so `Path::with_extension` does not
+/// treat the time segment as an extension (e.g. `recording.2026-07-13.12-00-00`
+/// + with_extension("h264") wrongly became `recording.2026-07-13.h264`).
 pub fn recording_stem(now: chrono::DateTime<chrono::Local>) -> String {
-    format!("recording.{}", now.format("%F.%H-%M-%S"))
+    format!("recording_{}", now.format("%Y-%m-%d_%H-%M-%S"))
+}
+
+/// Append a media extension without using `Path::with_extension` (safe with dotted names).
+pub fn with_media_ext(path_no_ext: &Path, ext: &str) -> PathBuf {
+    let ext = ext.trim_start_matches('.');
+    let mut os = path_no_ext.as_os_str().to_owned();
+    os.push(".");
+    os.push(ext);
+    PathBuf::from(os)
 }
 
 #[cfg(test)]
@@ -52,5 +64,34 @@ mod tests {
         let root = PathBuf::from("/opt/alvr");
         let p = resolve_capture_path(&root, "Captures/Records");
         assert_eq!(p, PathBuf::from("/opt/alvr/Captures/Records"));
+    }
+
+    #[test]
+    fn recording_name_keeps_seconds_when_adding_ext() {
+        use chrono::TimeZone;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 7, 13, 14, 30, 45)
+            .single()
+            .expect("valid local time");
+        let stem_name = recording_stem(now);
+        assert_eq!(stem_name, "recording_2026-07-13_14-30-45");
+
+        let video = with_media_ext(Path::new(&stem_name), "h264");
+        assert_eq!(
+            video.to_string_lossy(),
+            "recording_2026-07-13_14-30-45.h264"
+        );
+        let wav = with_media_ext(Path::new(&stem_name), "wav");
+        assert_eq!(wav.to_string_lossy(), "recording_2026-07-13_14-30-45.wav");
+    }
+
+    #[test]
+    fn with_extension_bug_demo() {
+        // Documents why we avoid Path::with_extension for timestamped stems.
+        let bad = PathBuf::from("recording.2026-07-13.14-30-45").with_extension("h264");
+        assert_eq!(
+            bad.file_name().unwrap().to_string_lossy(),
+            "recording.2026-07-13.h264"
+        );
     }
 }

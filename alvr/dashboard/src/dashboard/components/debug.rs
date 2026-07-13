@@ -6,7 +6,7 @@ pub fn debug_tab_ui(ui: &mut Ui) -> Option<ServerRequest> {
 
     ui.label(
         "Capture frame saves an SBS PNG into the configured screenshot folder (default Captures/Captures).
-Start/Stop recording writes elementary video + game-audio WAV into the recording folder (default Captures/Records).
+Start/Stop recording writes video (.mp4 bitstream) + game-audio WAV into the recording folder (default Captures/Records).
 Global hotkeys (default F8 screenshot / F9 toggle recording) work while the ALVR SteamVR driver is running.",
     );
 

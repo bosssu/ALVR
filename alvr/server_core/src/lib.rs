@@ -137,13 +137,8 @@ fn note_video_recording_bytes(connection_context: &ConnectionContext) {
 }
 
 pub fn create_recording_file(connection_context: &ConnectionContext, settings: &Settings) {
-    let codec = settings.video.preferred_codec;
-    let ext = match codec {
-        CodecType::H264 => "h264",
-        CodecType::Hevc => "h265",
-        CodecType::AV1 => "av1",
-    };
-
+    // Always use .mp4 as the on-disk extension. Payload remains the live encoder bitstream
+    // (H264/HEVC/AV1 elementary). Pair with the sibling .wav and remux for playback.
     let root = capture_paths::program_root();
     let dir = capture_paths::resolve_capture_path(&root, &settings.extra.capture.recording_dir);
     if let Err(e) = capture_paths::ensure_dir(&dir) {
@@ -152,7 +147,7 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
     }
 
     let stem = dir.join(capture_paths::recording_stem(chrono::Local::now()));
-    let video_path = capture_paths::with_media_ext(&stem, ext);
+    let video_path = capture_paths::with_media_ext(&stem, "mp4");
 
     match File::create(&video_path) {
         Ok(mut file) => {

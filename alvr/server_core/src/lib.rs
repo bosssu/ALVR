@@ -1,4 +1,3 @@
-mod audio_recording;
 mod bitrate;
 mod c_api;
 mod capture_paths;
@@ -9,6 +8,7 @@ mod haptics;
 mod hotkeys;
 mod input_mapping;
 mod logging_backend;
+mod recording_mux;
 mod sockets;
 mod statistics;
 mod tracking;
@@ -42,8 +42,6 @@ use std::{
     collections::HashSet,
     env,
     ffi::OsStr,
-    fs::File,
-    io::Write,
     path::PathBuf,
     sync::{
         Arc, LazyLock, OnceLock,
@@ -116,10 +114,12 @@ pub struct ConnectionContext {
     tracking_manager: RwLock<TrackingManager>,
     decoder_config: Mutex<Option<DecoderInitializationConfig>>,
     video_mirror_sender: Mutex<Option<broadcast::Sender<Vec<u8>>>>,
-    video_recording_file: Mutex<Option<File>>,
-    pub(crate) audio_recording: Mutex<audio_recording::AudioRecordingWriter>,
+    /// Active live MKV mux session (ffmpeg).
+    pub(crate) live_recording: Mutex<Option<recording_mux::LiveMuxSession>>,
+    /// Clone of live session audio queue for the game-audio tee (no long locks).
+    pub(crate) audio_tee_tx: Mutex<Option<flume::Sender<Vec<u8>>>>,
     /// Live loopback rate from the game-audio capture stream (updated when stream starts).
-    pub(crate) game_audio_sample_rate: std::sync::atomic::AtomicU32,
+    pub(crate) game_audio_sample_rate: AtomicU32,
     pub(crate) feedback_sounds: feedback_sounds::FeedbackSounds,
     connection_threads: Mutex<Vec<JoinHandle<()>>>,
     clients_to_be_removed: Mutex<HashSet<String>>,
@@ -127,11 +127,18 @@ pub struct ConnectionContext {
     haptics_sender: Mutex<Option<StreamSender<Haptics>>>,
 }
 
+pub fn is_recording(connection_context: &ConnectionContext) -> bool {
+    connection_context.live_recording.lock().is_some()
+}
+
 pub fn create_recording_file(connection_context: &ConnectionContext, settings: &Settings) {
+    // Stop any previous session first.
+    stop_recording_with_feedback(connection_context, false);
+
     let codec = settings.video.preferred_codec;
-    let ext = match codec {
+    let codec_hint = match codec {
         CodecType::H264 => "h264",
-        CodecType::Hevc => "h265",
+        CodecType::Hevc => "hevc",
         CodecType::AV1 => "av1",
     };
 
@@ -143,35 +150,25 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
     }
 
     let stem = dir.join(capture_paths::recording_stem(chrono::Local::now()));
-    let video_path = capture_paths::with_media_ext(&stem, ext);
+    let output_mkv = capture_paths::with_media_ext(&stem, "mkv");
 
-    // Play start tone before opening capture so most of the beep is outside the WAV.
     connection_context.feedback_sounds.play(
         feedback_sounds::FeedbackKind::RecStart,
         settings.extra.capture.feedback_sounds_enabled,
     );
 
-    match File::create(&video_path) {
-        Ok(mut file) => {
+    let sample_rate = connection_context
+        .game_audio_sample_rate
+        .load(Ordering::Relaxed);
+    let sample_rate = if sample_rate == 0 { 48000 } else { sample_rate };
+
+    match recording_mux::LiveMuxSession::start(output_mkv, sample_rate, codec_hint) {
+        Ok(session) => {
             if let Some(config) = &*connection_context.decoder_config.lock() {
-                file.write_all(&config.config_buffer).ok();
+                session.push_video(&config.config_buffer);
             }
-
-            *connection_context.video_recording_file.lock() = Some(file);
-
-            // Must match the live loopback rate (see connection game-audio thread).
-            let sample_rate = connection_context
-                .game_audio_sample_rate
-                .load(Ordering::Relaxed);
-            let sample_rate = if sample_rate == 0 { 48000 } else { sample_rate };
-
-            if let Err(e) = connection_context
-                .audio_recording
-                .lock()
-                .start(stem, sample_rate, 2)
-            {
-                error!("Failed to start recording WAV: {e}");
-            }
+            *connection_context.audio_tee_tx.lock() = Some(session.audio_sender());
+            *connection_context.live_recording.lock() = Some(session);
 
             connection_context
                 .events_sender
@@ -179,7 +176,7 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
                 .ok();
         }
         Err(e) => {
-            error!("Failed to record video on disk: {e}");
+            error!("Failed to start live MKV recording: {e}");
         }
     }
 }
@@ -189,15 +186,12 @@ pub fn stop_recording(connection_context: &ConnectionContext) {
 }
 
 pub fn stop_recording_with_feedback(connection_context: &ConnectionContext, play_sound: bool) {
-    let was_recording = connection_context.video_recording_file.lock().is_some()
-        || matches!(
-            connection_context.audio_recording.lock().state(),
-            audio_recording::AudioRecState::Recording
-        );
+    let was_recording = connection_context.live_recording.lock().is_some();
 
-    *connection_context.video_recording_file.lock() = None;
-    if let Err(e) = connection_context.audio_recording.lock().finalize() {
-        error!("Failed to finalize recording WAV: {e}");
+    *connection_context.audio_tee_tx.lock() = None;
+    if let Some(session) = connection_context.live_recording.lock().take() {
+        // finish() joins ffmpeg — may take a moment to flush the container.
+        session.finish();
     }
 
     if play_sound && was_recording {
@@ -313,8 +307,8 @@ impl ServerCoreContext {
             )),
             decoder_config: Mutex::new(None),
             video_mirror_sender: Mutex::new(None),
-            video_recording_file: Mutex::new(None),
-            audio_recording: Mutex::new(audio_recording::AudioRecordingWriter::new()),
+            live_recording: Mutex::new(None),
+            audio_tee_tx: Mutex::new(None),
             game_audio_sample_rate: AtomicU32::new(48000),
             feedback_sounds: feedback_sounds::FeedbackSounds::start(),
             connection_threads: Mutex::new(Vec::new()),
@@ -345,7 +339,7 @@ impl ServerCoreContext {
                         if !settings.extra.capture.hotkeys_enabled {
                             return;
                         }
-                        if ctx.video_recording_file.lock().is_some() {
+                        if is_recording(&ctx) {
                             stop_recording(&ctx);
                         } else {
                             create_recording_file(&ctx, &settings);
@@ -484,8 +478,8 @@ impl ServerCoreContext {
             sender.send(config_buffer.clone()).ok();
         }
 
-        if let Some(file) = &mut *self.connection_context.video_recording_file.lock() {
-            file.write_all(&config_buffer).ok();
+        if let Some(rec) = &*self.connection_context.live_recording.lock() {
+            rec.push_video(&config_buffer);
         }
 
         *self.connection_context.decoder_config.lock() = Some(DecoderInitializationConfig {
@@ -550,8 +544,8 @@ impl ServerCoreContext {
                     sender.send(nal_buffer.clone()).ok();
                 }
 
-                if let Some(file) = &mut *self.connection_context.video_recording_file.lock() {
-                    file.write_all(&nal_buffer).ok();
+                if let Some(rec) = &*self.connection_context.live_recording.lock() {
+                    rec.push_video(&nal_buffer);
                 }
 
                 let sender_result = sender.try_send(VideoPacket {

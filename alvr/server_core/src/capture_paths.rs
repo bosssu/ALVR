@@ -25,8 +25,8 @@ pub fn program_root() -> PathBuf {
 }
 
 /// Base name without extension. Use underscores so `Path::with_extension` does not
-/// treat the time segment as an extension (e.g. dotted timestamps were truncated).
-/// Video files are saved as `{stem}.mp4` (elementary bitstream payload).
+/// treat the time segment as an extension (e.g. `recording.2026-07-13.12-00-00`
+/// + with_extension("h264") wrongly became `recording.2026-07-13.h264`).
 pub fn recording_stem(now: chrono::DateTime<chrono::Local>) -> String {
     format!("recording_{}", now.format("%Y-%m-%d_%H-%M-%S"))
 }
@@ -76,10 +76,10 @@ mod tests {
         let stem_name = recording_stem(now);
         assert_eq!(stem_name, "recording_2026-07-13_14-30-45");
 
-        let video = with_media_ext(Path::new(&stem_name), "mp4");
+        let video = with_media_ext(Path::new(&stem_name), "h264");
         assert_eq!(
             video.to_string_lossy(),
-            "recording_2026-07-13_14-30-45.mp4"
+            "recording_2026-07-13_14-30-45.h264"
         );
         let wav = with_media_ext(Path::new(&stem_name), "wav");
         assert_eq!(wav.to_string_lossy(), "recording_2026-07-13_14-30-45.wav");

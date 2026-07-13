@@ -243,11 +243,10 @@ pub fn compute_restart_settings_hash(
     body_tracking_has_legs.hash(&mut h);
     // Misc
     settings.connection.minimum_idr_interval_ms.hash(&mut h);
+    // Only settings that are baked into the OpenVR C++ Settings snapshot need to be here.
+    // Hotkeys / recording paths are handled entirely in Rust and must NOT force a driver restart
+    // on every schema tweak (that shuts down handshake_loop and looks like instant disconnect).
     settings.extra.capture.screenshot_dir.hash(&mut h);
-    settings.extra.capture.recording_dir.hash(&mut h);
-    settings.extra.capture.hotkeys_enabled.hash(&mut h);
-    settings.extra.capture.screenshot_hotkey.hash(&mut h);
-    settings.extra.capture.recording_hotkey.hash(&mut h);
     settings.video.bitrate.image_corruption_fix.hash(&mut h);
     // Debug groups
     dbg.server_impl.hash(&mut h);

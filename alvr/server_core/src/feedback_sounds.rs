@@ -1,6 +1,9 @@
 use alvr_common::error;
 use std::{
-    sync::mpsc,
+    sync::{
+        mpsc,
+        Mutex,
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -12,13 +15,27 @@ pub enum FeedbackKind {
     RecStop,
 }
 
+/// Lazy feedback tones: the audio device is opened only on first play, not at driver load.
 pub struct FeedbackSounds {
-    tx: Option<mpsc::Sender<FeedbackKind>>,
+    inner: Mutex<Option<FeedbackInner>>,
+}
+
+struct FeedbackInner {
+    tx: mpsc::Sender<FeedbackKind>,
     join: Option<JoinHandle<()>>,
 }
 
 impl FeedbackSounds {
     pub fn start() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    fn ensure_started(inner: &mut Option<FeedbackInner>) {
+        if inner.is_some() {
+            return;
+        }
         let (tx, rx) = mpsc::channel::<FeedbackKind>();
         let join = thread::spawn(move || {
             let stream = match rodio::OutputStreamBuilder::open_default_stream() {
@@ -43,27 +60,34 @@ impl FeedbackSounds {
                 sink.append(src);
             }
         });
-        Self {
-            tx: Some(tx),
+        *inner = Some(FeedbackInner {
+            tx,
             join: Some(join),
-        }
+        });
     }
 
     pub fn play(&self, kind: FeedbackKind, enabled: bool) {
         if !enabled {
             return;
         }
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(kind);
+        let mut guard = self.inner.lock().unwrap();
+        Self::ensure_started(&mut guard);
+        if let Some(inner) = guard.as_ref() {
+            let _ = inner.tx.send(kind);
         }
     }
 }
 
 impl Drop for FeedbackSounds {
     fn drop(&mut self) {
-        self.tx.take();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        if let Ok(mut guard) = self.inner.lock() {
+            if let Some(mut inner) = guard.take() {
+                // Drop sender to end the thread, then join.
+                drop(inner.tx);
+                if let Some(join) = inner.join.take() {
+                    let _ = join.join();
+                }
+            }
         }
     }
 }

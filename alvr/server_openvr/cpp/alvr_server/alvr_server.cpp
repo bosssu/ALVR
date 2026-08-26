@@ -512,3 +512,20 @@ void CaptureFrame() {
     }
 #endif
 }
+
+void StartRecordingEncode() {
+#ifndef __APPLE__
+    if (g_driver_provider.hmd && g_driver_provider.hmd->m_encoder) {
+        g_driver_provider.hmd->m_encoder->StartRecordingEncode();
+    }
+#endif
+}
+
+void StopRecordingEncode() {
+#ifndef __APPLE__
+    SetRecordingMuxStreamFallback(false);
+    if (g_driver_provider.hmd && g_driver_provider.hmd->m_encoder) {
+        g_driver_provider.hmd->m_encoder->StopRecordingEncode();
+    }
+#endif
+}

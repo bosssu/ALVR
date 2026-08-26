@@ -78,6 +78,14 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_fov_sums_left_and_right_radians() {
+        let left = 52_f32.to_radians();
+        let right = 51.976959_f32.to_radians();
+        let deg = horizontal_fov_deg(left, right);
+        assert!((deg - 103.976959).abs() < 1e-4);
+    }
+
+    #[test]
     fn recording_name_keeps_seconds_when_adding_ext() {
         use chrono::TimeZone;
         let now = chrono::Local

@@ -25,6 +25,7 @@ use alvr_filesystem as afs;
 use alvr_packets::{ButtonValue, Haptics};
 use alvr_server_core::{
     HandType, ServerCoreContext, ServerCoreEvent, ServerNegotiatedStreamingConfig,
+    recording_max_fps,
 };
 use alvr_session::{
     BodyTrackingSinkConfig, CodecType, ControllersConfig, ControllersEmulationMode,
@@ -482,6 +483,8 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                 }
                 ServerCoreEvent::RequestIDR => unsafe { RequestIDR() },
                 ServerCoreEvent::CaptureFrame => unsafe { CaptureFrame() },
+                ServerCoreEvent::StartRecordingEncode => unsafe { StartRecordingEncode() },
+                ServerCoreEvent::StopRecordingEncode => unsafe { StopRecordingEncode() },
                 ServerCoreEvent::GameRenderLatencyFeedback(game_latency) => {
                     if cfg!(target_os = "linux") && game_latency.as_secs_f32() > 0.25 {
                         let now = Instant::now();
@@ -568,6 +571,39 @@ extern "C" fn send_haptics(device_id: u64, duration_s: f32, frequency: f32, ampl
 extern "C" fn get_headset_h_fov_deg() -> f32 {
     let fov = LOCAL_VIEW_PARAMS.read()[0].fov;
     (fov.left.abs() + fov.right.abs()).to_degrees()
+}
+
+#[unsafe(export_name = "GetRecordingMaxFps")]
+extern "C" fn get_recording_max_fps() -> f32 {
+    recording_max_fps()
+}
+
+#[unsafe(export_name = "SetRecordingVideoConfigNals")]
+extern "C" fn set_recording_video_config_nals(buffer_ptr: *const u8, len: i32, _codec: i32) {
+    if len <= 0 {
+        return;
+    }
+    let mut config_buffer = vec![0; len as usize];
+    unsafe { ptr::copy_nonoverlapping(buffer_ptr, config_buffer.as_mut_ptr(), len as usize) };
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        context.send_recording_video(config_buffer);
+    }
+}
+
+#[unsafe(export_name = "RecordingVideoSend")]
+extern "C" fn send_recording_video(
+    _timestamp_ns: u64,
+    buffer_ptr: *mut u8,
+    len: i32,
+    _is_idr: bool,
+) {
+    if len <= 0 {
+        return;
+    }
+    let buffer = unsafe { std::slice::from_raw_parts(buffer_ptr, len as usize) };
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        context.send_recording_video(buffer.to_vec());
+    }
 }
 
 #[unsafe(export_name = "SetVideoConfigNals")]

@@ -9,6 +9,7 @@ mod hotkeys;
 mod input_mapping;
 mod logging_backend;
 mod recording_mux;
+mod recording_source;
 mod sockets;
 mod statistics;
 mod tracking;
@@ -101,6 +102,8 @@ pub enum ServerCoreEvent {
     Buttons(Vec<ButtonEntry>), // Note: this is after mapping
     RequestIDR,
     CaptureFrame,
+    StartRecordingEncode,
+    StopRecordingEncode,
     GameRenderLatencyFeedback(Duration), // only used for SteamVR
     ShutdownPending,
     RestartPending,
@@ -117,11 +120,16 @@ pub struct ConnectionContext {
     /// Active live MKV mux session (ffmpeg).
     pub(crate) live_recording: Mutex<Option<recording_mux::LiveMuxSession>>,
     /// Clone of live session audio queue for the game-audio tee (no long locks).
-    pub(crate) audio_tee_tx: Mutex<Option<flume::Sender<Vec<u8>>>>,
+    pub(crate) audio_tee_tx: Mutex<Option<flume::Sender<recording_mux::TimedBytes>>>,
     /// Live loopback rate from the game-audio capture stream (updated when stream starts).
     pub(crate) game_audio_sample_rate: AtomicU32,
     /// Last connected-headset horizontal FOV in degrees, stored as f32 bits.
     pub(crate) last_h_fov_deg_bits: AtomicU32,
+    /// True after the mux has received dedicated recording-encoder NALs (pre-FFR).
+    pub(crate) recording_pre_ffr_nals: AtomicBool,
+    /// Stream-copy mux already wrote decoder SPS/PPS for this take.
+    pub(crate) recording_stream_config_prefixed: AtomicBool,
+    pub(crate) recording_last_kept: Mutex<Option<Instant>>,
     pub(crate) feedback_sounds: feedback_sounds::FeedbackSounds,
     connection_threads: Mutex<Vec<JoinHandle<()>>>,
     clients_to_be_removed: Mutex<HashSet<String>>,
@@ -137,7 +145,12 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
     // Stop any previous session first.
     stop_recording_with_feedback(connection_context, false);
 
-    let codec = settings.video.preferred_codec;
+    let codec = connection_context
+        .decoder_config
+        .lock()
+        .as_ref()
+        .map(|c| c.codec)
+        .unwrap_or(settings.video.preferred_codec);
     let codec_hint = match codec {
         CodecType::H264 => "h264",
         CodecType::Hevc => "hevc",
@@ -169,15 +182,28 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
         .load(Ordering::Relaxed);
     let sample_rate = if sample_rate == 0 { 48000 } else { sample_rate };
     let fallback_fps = settings.video.preferred_fps;
+    let mux_fps = if settings.extra.capture.recording_max_fps >= 1.0 {
+        settings.extra.capture.recording_max_fps
+    } else {
+        fallback_fps
+    };
 
-    match recording_mux::LiveMuxSession::start(output_mkv, sample_rate, codec_hint, fallback_fps) {
+    match recording_mux::LiveMuxSession::start(output_mkv, sample_rate, codec_hint, mux_fps) {
         Ok(session) => {
-            if let Some(config) = &*connection_context.decoder_config.lock() {
-                session.push_video(&config.config_buffer);
-            }
+            connection_context
+                .recording_pre_ffr_nals
+                .store(false, Ordering::Relaxed);
+            connection_context
+                .recording_stream_config_prefixed
+                .store(false, Ordering::Relaxed);
+            *connection_context.recording_last_kept.lock() = None;
             *connection_context.audio_tee_tx.lock() = Some(session.audio_sender());
             *connection_context.live_recording.lock() = Some(session);
 
+            connection_context
+                .events_sender
+                .send(ServerCoreEvent::StartRecordingEncode)
+                .ok();
             connection_context
                 .events_sender
                 .send(ServerCoreEvent::RequestIDR)
@@ -196,6 +222,17 @@ pub fn stop_recording(connection_context: &ConnectionContext) {
 pub fn stop_recording_with_feedback(connection_context: &ConnectionContext, play_sound: bool) {
     let was_recording = connection_context.live_recording.lock().is_some();
 
+    connection_context
+        .events_sender
+        .send(ServerCoreEvent::StopRecordingEncode)
+        .ok();
+    connection_context
+        .recording_pre_ffr_nals
+        .store(false, Ordering::Relaxed);
+    connection_context
+        .recording_stream_config_prefixed
+        .store(false, Ordering::Relaxed);
+    *connection_context.recording_last_kept.lock() = None;
     *connection_context.audio_tee_tx.lock() = None;
     if let Some(session) = connection_context.live_recording.lock().take() {
         // Never block the hotkey / SteamVR path on ffmpeg flush — finish in background.
@@ -249,6 +286,16 @@ pub fn notify_restart_driver() {
 
 pub fn settings() -> Settings {
     SESSION_MANAGER.read().settings().clone()
+}
+
+/// 0 = uncapped (match stream). Used by the OpenVR recording encoder.
+pub fn recording_max_fps() -> f32 {
+    SESSION_MANAGER
+        .read()
+        .settings()
+        .extra
+        .capture
+        .recording_max_fps
 }
 
 pub fn steamvr_hmd_init_config() -> SteamvrHmdInitConfig {
@@ -319,6 +366,9 @@ impl ServerCoreContext {
             audio_tee_tx: Mutex::new(None),
             game_audio_sample_rate: AtomicU32::new(48000),
             last_h_fov_deg_bits: AtomicU32::new(0.0f32.to_bits()),
+            recording_pre_ffr_nals: AtomicBool::new(false),
+            recording_stream_config_prefixed: AtomicBool::new(false),
+            recording_last_kept: Mutex::new(None),
             feedback_sounds: feedback_sounds::FeedbackSounds::start(),
             connection_threads: Mutex::new(Vec::new()),
             clients_to_be_removed: Mutex::new(HashSet::new()),
@@ -487,15 +537,23 @@ impl ServerCoreContext {
             sender.send(config_buffer.clone()).ok();
         }
 
-        if let Some(rec) = &*self.connection_context.live_recording.lock() {
-            rec.push_video(&config_buffer);
-        }
-
         *self.connection_context.decoder_config.lock() = Some(DecoderInitializationConfig {
             codec,
             config_buffer,
             ext_str: String::new(),
         });
+    }
+
+    pub fn send_recording_video(&self, buffer: Vec<u8>) {
+        if buffer.is_empty() {
+            return;
+        }
+        self.connection_context
+            .recording_pre_ffr_nals
+            .store(true, Ordering::Relaxed);
+        if let Some(rec) = &*self.connection_context.live_recording.lock() {
+            rec.push_video(&buffer);
+        }
     }
 
     pub fn send_video_nal(
@@ -553,8 +611,51 @@ impl ServerCoreContext {
                     sender.send(nal_buffer.clone()).ok();
                 }
 
-                if let Some(rec) = &*self.connection_context.live_recording.lock() {
-                    rec.push_video(&nal_buffer);
+                if recording_source::mux_stream_nals(
+                    self.connection_context.live_recording.lock().is_some(),
+                    self.connection_context
+                        .recording_pre_ffr_nals
+                        .load(Ordering::Relaxed),
+                ) {
+                    let max_fps = SESSION_MANAGER
+                        .read()
+                        .settings()
+                        .extra
+                        .capture
+                        .recording_max_fps;
+                    let now = Instant::now();
+                    let since_last = self
+                        .connection_context
+                        .recording_last_kept
+                        .lock()
+                        .map(|t| now.saturating_duration_since(t));
+                    let keep = is_idr
+                        || recording_source::should_keep_recording_frame(since_last, max_fps);
+                    if keep {
+                        let already = self
+                            .connection_context
+                            .recording_stream_config_prefixed
+                            .load(Ordering::Relaxed);
+                        if recording_source::should_prefix_decoder_config(is_idr, already) {
+                            if let Some(config) = &*self.connection_context.decoder_config.lock()
+                            {
+                                if !config.config_buffer.is_empty() {
+                                    if let Some(rec) =
+                                        &*self.connection_context.live_recording.lock()
+                                    {
+                                        rec.push_video(&config.config_buffer);
+                                    }
+                                    self.connection_context
+                                        .recording_stream_config_prefixed
+                                        .store(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        if let Some(rec) = &*self.connection_context.live_recording.lock() {
+                            rec.push_video(&nal_buffer);
+                        }
+                        *self.connection_context.recording_last_kept.lock() = Some(now);
+                    }
                 }
 
                 let sender_result = sender.try_send(VideoPacket {

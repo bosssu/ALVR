@@ -6,7 +6,7 @@ pub fn debug_tab_ui(ui: &mut Ui) -> Option<ServerRequest> {
 
     ui.label(
         "Capture frame saves an SBS JPEG into the configured screenshot folder (default Captures/Captures).
-Start/Stop recording captures bitstream + game audio and remuxes a lossless MKV (via ffmpeg) into Captures/Records.
+Start/Stop recording captures pre-FFR SBS (second encoder, high bitrate) + game audio into a lossless MKV. Headset stream stays FFR. Extra → Capture → Recording max FPS caps the file (0 = stream rate).
 Global hotkeys (default F8 screenshot / F9 toggle recording) work while the ALVR SteamVR driver is running.
 Requires ffmpeg on PATH or deps/windows/ffmpeg/bin.",
     );

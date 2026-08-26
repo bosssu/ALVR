@@ -1585,6 +1585,13 @@ pub struct CaptureConfig {
     pub feedback_sounds_enabled: bool,
 
     #[schema(strings(
+        display_name = "Recording max FPS",
+        help = "0 = same as the headset stream. Recording drops frames on the disk encoder only; streaming is unchanged. Typical values: 30 or 60."
+    ))]
+    #[schema(gui(slider(min = 0.0, max = 120.0, step = 1.0)), suffix = "Hz")]
+    pub recording_max_fps: f32,
+
+    #[schema(strings(
         display_name = "Recording folder",
         help = "Relative to ALVR install root, or absolute. Video + WAV written here."
     ))]
@@ -2275,6 +2282,7 @@ pub fn session_settings_default() -> SettingsDefault {
                 screenshot_hotkey: "F8".into(),
                 recording_hotkey: "F9".into(),
                 feedback_sounds_enabled: true,
+                recording_max_fps: 30.0,
                 recording_dir: "Captures/Records".into(),
                 screenshot_dir: "Captures/Captures".into(),
             },

@@ -10,7 +10,13 @@ enum AdaptiveQuantizationMode { SpatialAQ = 1, TemporalAQ = 2 };
 // Video encoder for NVIDIA NvEnc.
 class VideoEncoderNVENC : public VideoEncoder {
 public:
-    VideoEncoderNVENC(std::shared_ptr<CD3DRender> pD3DRender, int width, int height);
+    VideoEncoderNVENC(
+        std::shared_ptr<CD3DRender> pD3DRender,
+        int width,
+        int height,
+        bool recordingSink = false,
+        int codecOverride = -1
+    );
     ~VideoEncoderNVENC();
 
     void Initialize();
@@ -42,4 +48,5 @@ private:
     int m_renderWidth;
     int m_renderHeight;
     int m_bitrateInMBits;
+    bool m_recordingSink;
 };

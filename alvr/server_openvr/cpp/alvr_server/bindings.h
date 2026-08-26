@@ -199,8 +199,14 @@ extern "C" void LogEncoder(const char* stringPtr);
 extern "C" void LogPeriodically(const char* tag, const char* stringPtr);
 extern "C" void DriverReadyIdle(bool setDefaultChaprone);
 extern "C" void SetVideoConfigNals(const unsigned char* configBuffer, int len, int codec);
+extern "C" void SetRecordingVideoConfigNals(
+    const unsigned char* configBuffer, int len, int codec
+);
 extern "C" void
 VideoSend(unsigned long long targetTimestampNs, unsigned char* buf, int len, bool isIdr);
+extern "C" void RecordingVideoSend(
+    unsigned long long targetTimestampNs, unsigned char* buf, int len, bool isIdr
+);
 extern "C" void
 HapticsSend(unsigned long long path, float duration_s, float frequency, float amplitude);
 extern "C" void ShutdownRuntime();
@@ -245,10 +251,17 @@ extern "C" void ShutdownOpenvrClient();
 extern "C" void SetChaperoneArea(float areaWidth, float areaHeight);
 
 extern "C" void CaptureFrame();
+extern "C" void StartRecordingEncode();
+extern "C" void StopRecordingEncode();
+extern "C" void SetRecordingMuxStreamFallback(bool enabled);
 extern "C" float GetHeadsetHFovDeg();
+extern "C" float GetRecordingMaxFps();
 
 // NalParsing.cpp
 void ParseFrameNals(
+    int codec, unsigned char* buf, int len, unsigned long long targetTimestampNs, bool isIdr
+);
+void ParseRecordingNals(
     int codec, unsigned char* buf, int len, unsigned long long targetTimestampNs, bool isIdr
 );
 

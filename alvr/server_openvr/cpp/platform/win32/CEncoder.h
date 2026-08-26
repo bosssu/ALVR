@@ -9,7 +9,10 @@
 #include "VideoEncoderNVENC.h"
 #include "VideoEncoderVPL.h"
 #include "alvr_server/Utils.h"
+#include "d3d-render-utils/RenderPipeline.h"
 #include <atomic>
+#include <chrono>
+#include <memory>
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <map>
@@ -68,8 +71,12 @@ public:
 
     void CaptureFrame();
 
+    void StartRecordingEncode();
+    void StopRecordingEncode();
+
 private:
     void SaveScreenshotPng(ID3D11Texture2D* texture);
+    void SyncRecordingEncoder();
 
     CThreadEvent m_newFrameReady, m_encodeFinished;
     std::shared_ptr<VideoEncoder> m_videoEncoder;
@@ -80,6 +87,13 @@ private:
     std::shared_ptr<FrameRender> m_FrameRender;
     std::shared_ptr<CD3DRender> m_d3dRender;
     std::atomic_bool m_captureFrame { false };
+    std::atomic_bool m_wantRecordingEncode { false };
+    std::shared_ptr<VideoEncoder> m_recordingEncoder;
+    bool m_recordingNeedIdr = true;
+    bool m_hasRecordingKeep = false;
+    std::chrono::steady_clock::time_point m_lastRecordingKeep {};
+    ComPtr<ID3D11Texture2D> m_recordingScaled;
+    std::unique_ptr<d3d_render_utils::RenderPipeline> m_recordingBlit;
 
     IDRScheduler m_scheduler;
 };

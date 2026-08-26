@@ -69,7 +69,9 @@ PC-side capture runs in the **SteamVR driver process**. SteamVR + ALVR must be r
 - Default hotkey: **F9** — same key **toggles start / stop**.
 - Dashboard: **Debug** tab → **Start recording** / **Stop recording**.
 - Optional: **Extra → Capture → Start video recording at client connection**.
-- Captures the encoded bitstream plus **game audio** (loopback, not microphone), then remuxes a lossless MKV via ffmpeg when you stop.
+- On Windows, video is a **second encode of the pre-FFR SBS** (same layer as screenshots: real left/right, no packed midline swap). Headset streaming stays foveated. Disk encode uses a high VBR (~150 Mbps), not the Wi-Fi bitrate.
+- If that encoder cannot start, recording falls back to copying the streamed bitstream (packed FFR).
+- Game audio (loopback, not microphone) is muxed; ffmpeg remuxes a lossless MKV when you stop.
 - Default folder: `Captures/Records/`.
 - Filename: `recording_YYYYMMDD_HHMMSS_FOV_{horizontalDegrees}.mkv`.
 - Distinct start / stop beeps if feedback sounds are enabled.
@@ -85,6 +87,7 @@ PC-side capture runs in the **SteamVR driver process**. SteamVR + ALVR must be r
 | Screenshot hotkey | `F8` | `Ctrl` / `Alt` / `Shift` / `Win` + key, e.g. `Ctrl+F8`, `PrintScreen` |
 | Recording hotkey | `F9` | Toggle start/stop |
 | Feedback sounds | on | Screenshot / rec start / rec stop |
+| Recording max FPS | 30 | `0` = same as stream. Caps disk encode only (headset unchanged). |
 | Recording folder | `Captures/Records` | Relative to streamer root, or absolute |
 | Screenshot folder | `Captures/Captures` | Relative to streamer root, or absolute |
 | Rolling video files | off | Split files by duration (debug / bug reports) |

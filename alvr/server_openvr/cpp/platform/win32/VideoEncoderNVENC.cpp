@@ -5,13 +5,20 @@
 #include "alvr_server/Utils.h"
 #include "alvr_server/bindings.h"
 
-VideoEncoderNVENC::VideoEncoderNVENC(std::shared_ptr<CD3DRender> pD3DRender, int width, int height)
+VideoEncoderNVENC::VideoEncoderNVENC(
+    std::shared_ptr<CD3DRender> pD3DRender,
+    int width,
+    int height,
+    bool recordingSink,
+    int codecOverride
+)
     : m_pD3DRender(pD3DRender)
-    , m_codec(Settings_Instance()->m_codec)
+    , m_codec(codecOverride >= 0 ? codecOverride : Settings_Instance()->m_codec)
     , m_refreshRate(Settings_Instance()->m_refreshRate)
     , m_renderWidth(width)
     , m_renderHeight(height)
-    , m_bitrateInMBits(30) { }
+    , m_bitrateInMBits(recordingSink ? 150 : 30)
+    , m_recordingSink(recordingSink) { }
 
 VideoEncoderNVENC::~VideoEncoderNVENC() { }
 
@@ -23,7 +30,10 @@ void VideoEncoderNVENC::Initialize() {
     NV_ENC_BUFFER_FORMAT format
         = Settings_Instance()->m_enableHdr ? NV_ENC_BUFFER_FORMAT_NV12 : NV_ENC_BUFFER_FORMAT_ABGR;
 
-    if (Settings_Instance()->m_use10bitEncoder) {
+    if (m_recordingSink) {
+        // Screenshot/composition RGB is 8-bit; 10-bit/HDR stream settings break this session.
+        format = NV_ENC_BUFFER_FORMAT_ABGR;
+    } else if (Settings_Instance()->m_use10bitEncoder) {
         format = Settings_Instance()->m_enableHdr ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT
                                                   : NV_ENC_BUFFER_FORMAT_ABGR10;
     }
@@ -59,12 +69,15 @@ void VideoEncoderNVENC::Initialize() {
     try {
         m_NvNecoder->CreateEncoder(&initializeParams);
     } catch (NVENCException e) {
-        if (e.getErrorCode() == NV_ENC_ERR_INVALID_PARAM) {
-            throw MakeException(
-                "This GPU does not support H.265 encoding. (NvEncoderCuda NV_ENC_ERR_INVALID_PARAM)"
-            );
-        }
-        throw MakeException("NvEnc CreateEncoder failed. Code=%d %hs", e.getErrorCode(), e.what());
+        throw MakeException(
+            "NvEnc CreateEncoder failed. Code=%d %hs (codec=%d %dx%d recording=%d)",
+            e.getErrorCode(),
+            e.what(),
+            m_codec,
+            m_renderWidth,
+            m_renderHeight,
+            m_recordingSink ? 1 : 0
+        );
     }
 
     Debug("CNvEncoder is successfully initialized.\n");
@@ -95,22 +108,24 @@ void VideoEncoderNVENC::Shutdown() {
 void VideoEncoderNVENC::Transmit(
     ID3D11Texture2D* pTexture, uint64_t presentationTime, uint64_t targetTimestampNs, bool insertIDR
 ) {
-    auto params = GetDynamicEncoderParams();
-    if (params.updated) {
-        m_bitrateInMBits = params.bitrate_bps / 1'000'000;
-        NV_ENC_INITIALIZE_PARAMS initializeParams = { NV_ENC_INITIALIZE_PARAMS_VER };
-        NV_ENC_CONFIG encodeConfig = { NV_ENC_CONFIG_VER };
-        initializeParams.encodeConfig = &encodeConfig;
-        FillEncodeConfig(
-            initializeParams,
-            params.framerate,
-            m_renderWidth,
-            m_renderHeight,
-            m_bitrateInMBits * 1'000'000L
-        );
-        NV_ENC_RECONFIGURE_PARAMS reconfigureParams = { NV_ENC_RECONFIGURE_PARAMS_VER };
-        reconfigureParams.reInitEncodeParams = initializeParams;
-        m_NvNecoder->Reconfigure(&reconfigureParams);
+    if (!m_recordingSink) {
+        auto params = GetDynamicEncoderParams();
+        if (params.updated) {
+            m_bitrateInMBits = params.bitrate_bps / 1'000'000;
+            NV_ENC_INITIALIZE_PARAMS initializeParams = { NV_ENC_INITIALIZE_PARAMS_VER };
+            NV_ENC_CONFIG encodeConfig = { NV_ENC_CONFIG_VER };
+            initializeParams.encodeConfig = &encodeConfig;
+            FillEncodeConfig(
+                initializeParams,
+                params.framerate,
+                m_renderWidth,
+                m_renderHeight,
+                m_bitrateInMBits * 1'000'000L
+            );
+            NV_ENC_RECONFIGURE_PARAMS reconfigureParams = { NV_ENC_RECONFIGURE_PARAMS_VER };
+            reconfigureParams.reInitEncodeParams = initializeParams;
+            m_NvNecoder->Reconfigure(&reconfigureParams);
+        }
     }
 
     std::vector<std::vector<uint8_t>> vPacket;
@@ -155,7 +170,11 @@ void VideoEncoderNVENC::Transmit(
             fpOut.write(reinterpret_cast<char*>(buf), len);
         }
 
-        ParseFrameNals(m_codec, buf, len, targetTimestampNs, insertIDR);
+        if (m_recordingSink) {
+            ParseRecordingNals(m_codec, buf, len, targetTimestampNs, insertIDR);
+        } else {
+            ParseFrameNals(m_codec, buf, len, targetTimestampNs, insertIDR);
+        }
     }
 }
 
@@ -221,12 +240,21 @@ void VideoEncoderNVENC::FillEncodeConfig(
     initializeParams.frameRateNum = refreshRate;
     initializeParams.frameRateDen = 1;
 
-    if (Settings_Instance()->m_nvencRefreshRate != -1) {
+    if (m_recordingSink) {
+        float cap = GetRecordingMaxFps();
+        if (cap >= 1.f) {
+            int recFps = (int)(cap + 0.5f);
+            if (recFps < 1) {
+                recFps = 1;
+            }
+            initializeParams.frameRateNum = recFps;
+        }
+    } else if (Settings_Instance()->m_nvencRefreshRate != -1) {
         initializeParams.frameRateNum = Settings_Instance()->m_nvencRefreshRate;
     }
 
     initializeParams.enableWeightedPrediction
-        = Settings_Instance()->m_nvencEnableWeightedPrediction;
+        = m_recordingSink ? 0 : Settings_Instance()->m_nvencEnableWeightedPrediction;
 
     // 16 is recommended when using reference frame invalidation. But it has caused bad visual
     // quality. Now, use 0 (use default).
@@ -300,7 +328,7 @@ void VideoEncoderNVENC::FillEncodeConfig(
         config.maxNumRefFramesInDPB = maxNumRefFrames;
         config.idrPeriod = gopLength;
 
-        if (Settings_Instance()->m_use10bitEncoder) {
+        if (!m_recordingSink && Settings_Instance()->m_use10bitEncoder) {
             encodeConfig.encodeCodecConfig.hevcConfig.pixelBitDepthMinus8 = 2;
         }
 

@@ -2,8 +2,16 @@
 #include "Logger.h"
 #include "Utils.h"
 #include "bindings.h"
+#include <atomic>
 #include <mutex>
 #include <string.h>
+
+static thread_local bool t_recordingNals = false;
+static std::atomic<bool> g_recordingMuxStreamFallback { false };
+
+void SetRecordingMuxStreamFallback(bool enabled) {
+    g_recordingMuxStreamFallback.store(enabled);
+}
 
 static const char NAL_PREFIX_3B[] = { 0x00, 0x00, 0x01 };
 static const char NAL_PREFIX_4B[] = { 0x00, 0x00, 0x00, 0x01 };
@@ -58,7 +66,11 @@ void sendHeaders(int codec, unsigned char*& buf, int& len, int nalNum) {
         return;
     }
 
-    SetVideoConfigNals((const unsigned char*)buf, headersLen, codec);
+    if (t_recordingNals) {
+        SetRecordingVideoConfigNals((const unsigned char*)buf, headersLen, codec);
+    } else {
+        SetVideoConfigNals((const unsigned char*)buf, headersLen, codec);
+    }
 
     // move the cursor forward excluding config NALs
     buf = cursor;
@@ -99,6 +111,7 @@ void ParseFrameNals(
     int codec, unsigned char* buf, int len, unsigned long long targetTimestampNs, bool isIdr
 ) {
     static bool av1GotFrame = false;
+    static bool av1GotRecordingFrame = false;
 
     if ((unsigned)len < sizeof(NAL_PREFIX_4B)) {
         return;
@@ -108,10 +121,32 @@ void ParseFrameNals(
         processH264Nals(buf, len);
     } else if (codec == ALVR_CODEC_HEVC) {
         processHevcNals(buf, len);
-    } else if (codec == ALVR_CODEC_AV1 && !av1GotFrame) {
-        av1GotFrame = true;
-        SetVideoConfigNals(0, 0, codec);
+    } else if (codec == ALVR_CODEC_AV1) {
+        if (t_recordingNals) {
+            if (!av1GotRecordingFrame) {
+                av1GotRecordingFrame = true;
+                SetRecordingVideoConfigNals(0, 0, codec);
+            }
+        } else if (!av1GotFrame) {
+            av1GotFrame = true;
+            SetVideoConfigNals(0, 0, codec);
+        }
     }
 
-    VideoSend(targetTimestampNs, buf, len, isIdr);
+    if (t_recordingNals) {
+        RecordingVideoSend(targetTimestampNs, buf, len, isIdr);
+    } else {
+        VideoSend(targetTimestampNs, buf, len, isIdr);
+        if (g_recordingMuxStreamFallback.load()) {
+            RecordingVideoSend(targetTimestampNs, buf, len, isIdr);
+        }
+    }
+}
+
+void ParseRecordingNals(
+    int codec, unsigned char* buf, int len, unsigned long long targetTimestampNs, bool isIdr
+) {
+    t_recordingNals = true;
+    ParseFrameNals(codec, buf, len, targetTimestampNs, isIdr);
+    t_recordingNals = false;
 }

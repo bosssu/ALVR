@@ -3,10 +3,71 @@ use std::{
     env,
     fmt::{self, Display, Formatter},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::Command,
+    thread,
+    time::Duration,
     vec,
 };
 use xshell::{Shell, cmd};
+
+/// Copy `src` over `dst`. On Windows, if SteamVR/ALVR still has the file open
+/// (os error 32), stop those processes and retry.
+fn copy_replace(src: impl AsRef<Path>, dst: impl AsRef<Path>) {
+    let src = src.as_ref();
+    let dst = dst.as_ref();
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+
+    const WIN_SHARING_VIOLATION: i32 = 32;
+    let mut last_err = None;
+    for attempt in 0..6 {
+        match fs::copy(src, dst) {
+            Ok(_) => return,
+            Err(e) => {
+                let locked = cfg!(windows) && e.raw_os_error() == Some(WIN_SHARING_VIOLATION);
+                last_err = Some(e);
+                if !locked {
+                    break;
+                }
+                eprintln!(
+                    "File in use, stopping SteamVR/ALVR and retrying ({}/6): {}",
+                    attempt + 1,
+                    dst.display()
+                );
+                stop_windows_vr_lockers();
+                thread::sleep(Duration::from_millis(700));
+            }
+        }
+    }
+    panic!(
+        "failed to copy `{}` to `{}`: {}",
+        src.display(),
+        dst.display(),
+        last_err.unwrap()
+    );
+}
+
+fn stop_windows_vr_lockers() {
+    if !cfg!(windows) {
+        return;
+    }
+    // Driver DLL is loaded by vrserver; dashboard exe is its own process.
+    for name in [
+        "vrserver.exe",
+        "vrmonitor.exe",
+        "vrdashboard.exe",
+        "vrcompositor.exe",
+        "ALVR Dashboard.exe",
+    ] {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", name, "/T"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
 
 #[derive(Clone, Copy)]
 pub enum Profile {
@@ -149,20 +210,18 @@ pub fn build_streamer(
         .run()
         .unwrap();
 
-        sh.copy_file(
+        copy_replace(
             artifacts_dir.join(afs::dynlib_fname("alvr_server_openvr")),
             build_layout.openvr_driver_lib(),
-        )
-        .unwrap();
+        );
 
         if cfg!(windows) {
-            sh.copy_file(
+            copy_replace(
                 artifacts_dir.join("alvr_server_openvr.pdb"),
                 build_layout
                     .openvr_driver_lib_dir()
                     .join("alvr_server_openvr.pdb"),
-            )
-            .unwrap();
+            );
         }
     }
 
@@ -171,11 +230,10 @@ pub fn build_streamer(
         let _push_guard = sh.push_dir(afs::crate_dir("dashboard"));
         cmd!(sh, "cargo build {common_flags_ref...}").run().unwrap();
 
-        sh.copy_file(
+        copy_replace(
             artifacts_dir.join(afs::exec_fname("alvr_dashboard")),
             build_layout.dashboard_exe(),
-        )
-        .unwrap();
+        );
     }
 
     // copy dependencies

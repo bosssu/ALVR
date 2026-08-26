@@ -22,6 +22,8 @@ public:
     void InsertIDR();
     bool IsConnected() { return m_connected; }
     void CaptureFrame();
+    void StartRecordingEncode();
+    void StopRecordingEncode();
 
 private:
     void GetFds(int client, int (*fds)[6]);

@@ -952,9 +952,12 @@ fn connection_pipeline(
                     let tee = {
                         let ctx = Arc::clone(&ctx);
                         Some(Box::new(move |bytes: &[u8]| {
-                            // Non-blocking queue into live mux (or no-op when not recording).
+                            // Stamp in the WASAPI callback; mux queue delay must not shift PCM.
                             if let Some(tx) = &*ctx.audio_tee_tx.lock() {
-                                let _ = tx.send(bytes.to_vec());
+                                let _ = tx.send(crate::recording_mux::TimedBytes {
+                                    at: std::time::Instant::now(),
+                                    data: bytes.to_vec(),
+                                });
                             }
                         })
                             as Box<dyn FnMut(&[u8]) + Send>)

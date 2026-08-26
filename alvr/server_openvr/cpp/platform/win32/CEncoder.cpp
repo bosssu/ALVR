@@ -1,9 +1,14 @@
 #include "CEncoder.h"
 
+#include "ALVR-common/packet_types.h"
 #include "alvr_server/Logger.h"
 #include "alvr_server/Settings.h"
 #include "alvr_server/Utils.h"
 #include "alvr_server/bindings.h"
+#include "d3d-render-utils/RenderUtils.h"
+
+#include <algorithm>
+#include <cmath>
 
 #include <atomic>
 #include <chrono>
@@ -23,6 +28,12 @@ CEncoder::CEncoder()
 }
 
 CEncoder::~CEncoder() {
+    if (m_recordingEncoder) {
+        m_recordingEncoder->Shutdown();
+        m_recordingEncoder.reset();
+    }
+    m_recordingBlit.reset();
+    m_recordingScaled.Reset();
     if (m_videoEncoder) {
         m_videoEncoder->Shutdown();
         m_videoEncoder.reset();
@@ -154,6 +165,35 @@ void CEncoder::Run() {
                 }
             }
 
+            SyncRecordingEncoder();
+            if (m_recordingEncoder) {
+                if (auto shot = m_FrameRender->GetScreenshotTexture()) {
+                    const float maxFps = GetRecordingMaxFps();
+                    const auto now = std::chrono::steady_clock::now();
+                    bool drop = false;
+                    if (maxFps >= 1.0f && m_hasRecordingKeep && !m_recordingNeedIdr) {
+                        const auto minInterval = std::chrono::duration<double>(1.0 / (double)maxFps);
+                        if ((now - m_lastRecordingKeep) < minInterval) {
+                            drop = true;
+                        }
+                    }
+                    if (!drop) {
+                        ID3D11Texture2D* src = shot.Get();
+                        if (m_recordingBlit && m_recordingScaled) {
+                            m_recordingBlit->Render();
+                            src = m_recordingScaled.Get();
+                        }
+                        bool idr = m_recordingNeedIdr;
+                        m_recordingNeedIdr = false;
+                        m_lastRecordingKeep = now;
+                        m_hasRecordingKeep = true;
+                        m_recordingEncoder->Transmit(
+                            src, m_presentationTime, m_targetTimestampNs, idr
+                        );
+                    }
+                }
+            }
+
             m_videoEncoder->Transmit(
                 m_FrameRender->GetTexture().Get(),
                 m_presentationTime,
@@ -168,8 +208,15 @@ void CEncoder::Run() {
 
 void CEncoder::Stop() {
     m_bExiting = true;
+    m_wantRecordingEncode.store(false);
     m_newFrameReady.Set();
     Join();
+    if (m_recordingEncoder) {
+        m_recordingEncoder->Shutdown();
+        m_recordingEncoder.reset();
+    }
+    m_recordingBlit.reset();
+    m_recordingScaled.Reset();
     m_FrameRender.reset();
 }
 
@@ -185,6 +232,153 @@ void CEncoder::OnStreamStart() { m_scheduler.OnStreamStart(); }
 void CEncoder::InsertIDR() { m_scheduler.InsertIDR(); }
 
 void CEncoder::CaptureFrame() { m_captureFrame = true; }
+
+void CEncoder::StartRecordingEncode() {
+    m_recordingNeedIdr = true;
+    m_hasRecordingKeep = false;
+    m_wantRecordingEncode.store(true);
+}
+
+void CEncoder::StopRecordingEncode() { m_wantRecordingEncode.store(false); }
+
+static int Align32(int v) {
+    v &= ~31;
+    return v < 32 ? 32 : v;
+}
+
+static void FitNvencSize(int srcW, int srcH, int maxDim, int* outW, int* outH) {
+    float scale = 1.0f;
+    if (srcW > maxDim) {
+        scale = (float)maxDim / (float)srcW;
+    }
+    if ((int)(srcH * scale) > maxDim) {
+        scale = (float)maxDim / (float)srcH;
+    }
+    *outW = Align32((int)std::lround((float)srcW * scale));
+    *outH = Align32((int)std::lround((float)srcH * scale));
+}
+
+void CEncoder::SyncRecordingEncoder() {
+    const bool want = m_wantRecordingEncode.load();
+    if (want && !m_recordingEncoder) {
+        auto shot = m_FrameRender ? m_FrameRender->GetScreenshotTexture() : nullptr;
+        int srcW = Settings_Instance()->m_renderWidth;
+        int srcH = Settings_Instance()->m_renderHeight;
+        if (shot) {
+            D3D11_TEXTURE2D_DESC desc {};
+            shot->GetDesc(&desc);
+            srcW = (int)desc.Width;
+            srcH = (int)desc.Height;
+        }
+
+        const int streamCodec = Settings_Instance()->m_codec;
+        Exception lastErr("no encoder attempted");
+        bool started = false;
+
+        auto tryStart = [&](int codec, int maxDim) {
+            int encW = 0, encH = 0;
+            FitNvencSize(srcW, srcH, maxDim, &encW, &encH);
+            Info(
+                "Starting pre-FFR recording encoder %dx%d (src %dx%d) codec=%d\n",
+                encW,
+                encH,
+                srcW,
+                srcH,
+                codec
+            );
+            auto enc = std::make_shared<VideoEncoderNVENC>(
+                m_d3dRender, encW, encH, true, codec
+            );
+            enc->Initialize();
+
+            m_recordingBlit.reset();
+            m_recordingScaled.Reset();
+            if (encW != srcW || encH != srcH) {
+                if (!shot) {
+                    throw MakeException("No screenshot texture to scale for recording");
+                }
+                DXGI_FORMAT fmt = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+                D3D11_TEXTURE2D_DESC srcDesc {};
+                shot->GetDesc(&srcDesc);
+                fmt = srcDesc.Format;
+                m_recordingScaled.Attach(d3d_render_utils::CreateTexture(
+                    m_d3dRender->GetDevice(), (uint32_t)encW, (uint32_t)encH, fmt
+                ));
+                std::vector<uint8_t> quadCso(
+                    QUAD_SHADER_CSO_PTR, QUAD_SHADER_CSO_PTR + QUAD_SHADER_CSO_LEN
+                );
+                std::vector<uint8_t> blitCso(
+                    COLOR_CORRECTION_CSO_PTR,
+                    COLOR_CORRECTION_CSO_PTR + COLOR_CORRECTION_CSO_LEN
+                );
+                struct ColorCorrection {
+                    float renderWidth;
+                    float renderHeight;
+                    float brightness;
+                    float contrast;
+                    float saturation;
+                    float gamma;
+                    float sharpening;
+                    float _align;
+                };
+                ColorCorrection cc
+                    = { (float)srcW, (float)srcH, 0.f, 1.f, 1.f, 1.f, 0.f, 0.f };
+                auto* buf = d3d_render_utils::CreateBuffer(m_d3dRender->GetDevice(), cc);
+                auto pipeline = std::make_unique<d3d_render_utils::RenderPipeline>(
+                    m_d3dRender->GetDevice()
+                );
+                ComPtr<ID3D11VertexShader> vs
+                    = d3d_render_utils::CreateVertexShader(m_d3dRender->GetDevice(), quadCso);
+                pipeline->Initialize(
+                    { shot.Get() }, vs.Get(), blitCso, m_recordingScaled.Get(), buf
+                );
+                m_recordingBlit = std::move(pipeline);
+            }
+
+            m_recordingEncoder = enc;
+            m_recordingNeedIdr = true;
+            SetRecordingMuxStreamFallback(false);
+        };
+
+        const int attemptCodec[] = { streamCodec, ALVR_CODEC_H264 };
+        const int attemptMax[]
+            = { streamCodec == ALVR_CODEC_H264 ? 4096 : 8192, 4096 };
+        for (int i = 0; i < 2; ++i) {
+            if (i > 0 && attemptCodec[i] == streamCodec) {
+                continue;
+            }
+            try {
+                tryStart(attemptCodec[i], attemptMax[i]);
+                started = true;
+                break;
+            } catch (Exception e) {
+                lastErr = e;
+                Warn(
+                    "Pre-FFR recording encoder codec=%d failed: %s\n",
+                    attemptCodec[i],
+                    e.what()
+                );
+                m_recordingEncoder.reset();
+                m_recordingBlit.reset();
+                m_recordingScaled.Reset();
+            }
+        }
+        if (!started) {
+            Warn(
+                "Pre-FFR recording encoder unavailable (%s); muxing streamed bitstream\n",
+                lastErr.what()
+            );
+            m_wantRecordingEncode.store(false);
+        }
+    } else if (!want && m_recordingEncoder) {
+        Info("Stopping pre-FFR recording encoder\n");
+        m_recordingEncoder->Shutdown();
+        m_recordingEncoder.reset();
+        m_recordingBlit.reset();
+        m_recordingScaled.Reset();
+        SetRecordingMuxStreamFallback(false);
+    }
+}
 
 static std::wstring Utf8ToWide(const std::string& s) {
     if (s.empty()) {

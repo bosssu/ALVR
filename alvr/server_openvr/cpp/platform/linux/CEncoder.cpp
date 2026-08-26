@@ -319,3 +319,10 @@ void CEncoder::OnStreamStart() { m_scheduler.OnStreamStart(); }
 void CEncoder::InsertIDR() { m_scheduler.InsertIDR(); }
 
 void CEncoder::CaptureFrame() { m_captureFrame = true; }
+
+void CEncoder::StartRecordingEncode() {
+    // Linux still muxes the streamed bitstream (packed FFR).
+    SetRecordingMuxStreamFallback(true);
+}
+
+void CEncoder::StopRecordingEncode() { SetRecordingMuxStreamFallback(false); }

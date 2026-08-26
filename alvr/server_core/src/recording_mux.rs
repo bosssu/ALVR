@@ -203,22 +203,6 @@ fn wait_join(join: JoinHandle<()>, timeout: Duration) {
     }
 }
 
-fn write_analysis_sidecar(output_mkv: &Path, body: &str) {
-    let path = output_mkv.with_extension("analysis.txt");
-    match fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        Ok(mut f) => {
-            if let Err(e) = f.write_all(body.as_bytes()) {
-                warn!("Recording analysis sidecar write: {e}");
-            }
-        }
-        Err(e) => warn!("Recording analysis sidecar: {e}"),
-    }
-}
-
 fn find_ffmpeg() -> Option<PathBuf> {
     // PATH ffmpeg may be an old build (this tree has seen Lavf58 muxes). Prefer
     // the copy next to the streamer / in deps so setts restamp is available.
@@ -522,27 +506,6 @@ fn capture_and_mux_worker(
         }
     }
 
-    write_analysis_sidecar(
-        &output_mkv,
-        &format!(
-            "wall_s={:.6}\nvideo_span_s={:.6}\naudio_s={:.6}\nduration_s={:.6}\npictures={}\npackets={}\nvideo_bytes={}\naudio_bytes={}\nsilence_s={:.6}\nsample_rate={}\ncap_fps={:.6}\nmux_fps={:.6}\ndemux={}\nffmpeg={}\n",
-            wall.as_secs_f64(),
-            span_s,
-            audio_secs,
-            duration_s,
-            pictures,
-            packets,
-            v_bytes,
-            a_bytes,
-            silence_secs,
-            sample_rate,
-            fallback_fps,
-            fps,
-            demux,
-            ffmpeg.display()
-        ),
-    );
-
     if v_bytes == 0 && a_bytes == 0 {
         let _ = fs::remove_file(&video_tmp);
         let _ = fs::remove_file(&audio_tmp);
@@ -723,17 +686,6 @@ fn run_ffmpeg_mux(
         "Recording ffmpeg: {} -f {demux} -framerate {fps:.4} -c:v copy setts={fps:.4}Hz duration_hint={duration_s:.3}s -> {}",
         ffmpeg.display(),
         output_mkv.display()
-    );
-
-    write_analysis_sidecar(
-        output_mkv,
-        &format!(
-            "ffmpeg={}\ndemux={}\nmux_fps={:.6}\nduration_hint_s={:.6}\nhas_video={has_video}\nhas_audio={has_audio}\nbsf=setts\n",
-            ffmpeg.display(),
-            demux,
-            fps,
-            duration_s
-        ),
     );
 
     let child = cmd

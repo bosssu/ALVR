@@ -1559,6 +1559,10 @@ pub struct RollingVideoFilesConfig {
     pub duration_s: u64,
 }
 
+fn default_recording_max_dimension() -> u32 {
+    1920
+}
+
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
 pub struct CaptureConfig {
     #[schema(strings(display_name = "Start video recording at client connection"))]
@@ -1590,6 +1594,14 @@ pub struct CaptureConfig {
     ))]
     #[schema(gui(slider(min = 0.0, max = 120.0, step = 1.0)), suffix = "Hz")]
     pub recording_max_fps: f32,
+
+    #[schema(strings(
+        display_name = "Recording max dimension",
+        help = "Longest edge of the recording SBS (pixels). 0 = encode at the stream size (codec limit still applies). Default 1920. Headset resolution is unchanged."
+    ))]
+    #[schema(gui(slider(min = 0, max = 8192, step = 32)), suffix = "px")]
+    #[serde(default = "default_recording_max_dimension")]
+    pub recording_max_dimension: u32,
 
     #[schema(strings(
         display_name = "Recording folder",
@@ -2282,7 +2294,8 @@ pub fn session_settings_default() -> SettingsDefault {
                 screenshot_hotkey: "F8".into(),
                 recording_hotkey: "F9".into(),
                 feedback_sounds_enabled: true,
-                recording_max_fps: 30.0,
+                recording_max_fps: 0.0,
+                recording_max_dimension: 1920,
                 recording_dir: "Captures/Records".into(),
                 screenshot_dir: "Captures/Captures".into(),
             },

@@ -126,6 +126,10 @@ public:
     */
     virtual void EncodeFrame(std::vector<std::vector<uint8_t>> &vPacket, NV_ENC_PIC_PARAMS *pPicParams = nullptr);
 
+    /** Submit without waiting for the bitstream. Pair with DrainEncodedPackets. */
+    void SubmitEncode(NV_ENC_PIC_PARAMS *pPicParams = nullptr);
+    void DrainEncodedPackets(std::vector<std::vector<uint8_t>> &vPacket);
+
     /**
     *  @brief  This function to flush the encoder queue.
     *  The encoder might be queuing frames for B picture encoding or lookahead;

@@ -108,6 +108,16 @@ void VideoEncoderNVENC::Shutdown() {
 void VideoEncoderNVENC::Transmit(
     ID3D11Texture2D* pTexture, uint64_t presentationTime, uint64_t targetTimestampNs, bool insertIDR
 ) {
+    SubmitFrame(pTexture, presentationTime, targetTimestampNs, insertIDR);
+    DrainFrame();
+}
+
+void VideoEncoderNVENC::SubmitFrame(
+    ID3D11Texture2D* pTexture,
+    uint64_t /*presentationTime*/,
+    uint64_t targetTimestampNs,
+    bool insertIDR
+) {
     if (!m_recordingSink) {
         auto params = GetDynamicEncoderParams();
         if (params.updated) {
@@ -128,8 +138,6 @@ void VideoEncoderNVENC::Transmit(
         }
     }
 
-    std::vector<std::vector<uint8_t>> vPacket;
-
     const NvEncInputFrame* encoderInputFrame = m_NvNecoder->GetNextInputFrame();
 
     ID3D11Texture2D* pInputTexture
@@ -141,7 +149,14 @@ void VideoEncoderNVENC::Transmit(
         Debug("Inserting IDR frame.\n");
         picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
     }
-    m_NvNecoder->EncodeFrame(vPacket, &picParams);
+    m_pendingTimestampNs = targetTimestampNs;
+    m_pendingIdr = insertIDR;
+    m_NvNecoder->SubmitEncode(&picParams);
+}
+
+void VideoEncoderNVENC::DrainFrame() {
+    std::vector<std::vector<uint8_t>> vPacket;
+    m_NvNecoder->DrainEncodedPackets(vPacket);
 
     for (std::vector<uint8_t>& packet : vPacket) {
         uint8_t* buf = packet.data();
@@ -171,9 +186,9 @@ void VideoEncoderNVENC::Transmit(
         }
 
         if (m_recordingSink) {
-            ParseRecordingNals(m_codec, buf, len, targetTimestampNs, insertIDR);
+            ParseRecordingNals(m_codec, buf, len, m_pendingTimestampNs, m_pendingIdr);
         } else {
-            ParseFrameNals(m_codec, buf, len, targetTimestampNs, insertIDR);
+            ParseFrameNals(m_codec, buf, len, m_pendingTimestampNs, m_pendingIdr);
         }
     }
 }
@@ -203,7 +218,9 @@ void VideoEncoderNVENC::FillEncodeConfig(
     GUID qualityPreset;
     // See recommended NVENC settings for low-latency encoding.
     // https://docs.nvidia.com/video-technologies/video-codec-sdk/nvenc-video-encoder-api-prog-guide/#recommended-nvenc-settings
-    switch (Settings_Instance()->m_nvencQualityPreset) {
+    if (m_recordingSink) {
+        qualityPreset = NV_ENC_PRESET_P4_GUID;
+    } else switch (Settings_Instance()->m_nvencQualityPreset) {
     case 7:
         qualityPreset = NV_ENC_PRESET_P7_GUID;
         break;
@@ -229,7 +246,9 @@ void VideoEncoderNVENC::FillEncodeConfig(
     }
 
     NV_ENC_TUNING_INFO tuningPreset
-        = static_cast<NV_ENC_TUNING_INFO>(Settings_Instance()->m_nvencTuningPreset);
+        = m_recordingSink
+        ? NV_ENC_TUNING_INFO_LOW_LATENCY
+        : static_cast<NV_ENC_TUNING_INFO>(Settings_Instance()->m_nvencTuningPreset);
 
     m_NvNecoder->CreateDefaultEncoderParams(
         &initializeParams, encoderGUID, qualityPreset, tuningPreset
@@ -442,5 +461,20 @@ void VideoEncoderNVENC::FillEncodeConfig(
     }
     if (Settings_Instance()->m_nvencRcAverageBitrate != -1) {
         encodeConfig.rcParams.averageBitRate = Settings_Instance()->m_nvencRcAverageBitrate;
+    }
+
+    if (m_recordingSink) {
+        // Disk encode: CQ, not the 150 Mbps CBR used previously. Headset encode is unchanged.
+        encodeConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
+        encodeConfig.rcParams.constQP.qpIntra = 23;
+        encodeConfig.rcParams.constQP.qpInterP = 23;
+        encodeConfig.rcParams.constQP.qpInterB = 23;
+        encodeConfig.rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
+        encodeConfig.rcParams.enableAQ = 0;
+        encodeConfig.rcParams.enableTemporalAQ = 0;
+        encodeConfig.rcParams.averageBitRate = 0;
+        encodeConfig.rcParams.maxBitRate = 0;
+        encodeConfig.rcParams.vbvBufferSize = 0;
+        encodeConfig.rcParams.vbvInitialDelay = 0;
     }
 }

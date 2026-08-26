@@ -256,6 +256,9 @@ extern "C" void StopRecordingEncode();
 extern "C" void SetRecordingMuxStreamFallback(bool enabled);
 extern "C" float GetHeadsetHFovDeg();
 extern "C" float GetRecordingMaxFps();
+extern "C" unsigned int GetRecordingPipelineSlots();
+extern "C" void GetRecordingEncodeSize(int srcW, int srcH, int codec, int* outW, int* outH);
+extern "C" void NoteRecordingFrameSubmit();
 
 // NalParsing.cpp
 void ParseFrameNals(

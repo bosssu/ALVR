@@ -13,6 +13,9 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <map>
@@ -77,6 +80,10 @@ public:
 private:
     void SaveScreenshotPng(ID3D11Texture2D* texture);
     void SyncRecordingEncoder();
+    void EnsureRecordingWorker();
+    void StopRecordingWorker();
+    void RecordingWorker();
+    void WaitRecordingIdle();
 
     CThreadEvent m_newFrameReady, m_encodeFinished;
     std::shared_ptr<VideoEncoder> m_videoEncoder;
@@ -88,12 +95,24 @@ private:
     std::shared_ptr<CD3DRender> m_d3dRender;
     std::atomic_bool m_captureFrame { false };
     std::atomic_bool m_wantRecordingEncode { false };
-    std::shared_ptr<VideoEncoder> m_recordingEncoder;
+    std::shared_ptr<VideoEncoderNVENC> m_recordingEncoder;
     bool m_recordingNeedIdr = true;
     bool m_hasRecordingKeep = false;
     std::chrono::steady_clock::time_point m_lastRecordingKeep {};
     ComPtr<ID3D11Texture2D> m_recordingScaled;
+    static const int kRecordingMaxSlots = 8;
+    ComPtr<ID3D11Texture2D> m_recordingSlots[kRecordingMaxSlots];
+    bool m_recordingSlotIdr[kRecordingMaxSlots] {};
+    int m_recordingSlotCount = 3;
+    std::mutex m_recordingQueueMutex;
+    std::vector<int> m_recordingFree;
+    std::vector<int> m_recordingJobs;
+    std::atomic<unsigned> m_recordingInFlight { 0 };
     std::unique_ptr<d3d_render_utils::RenderPipeline> m_recordingBlit;
+    std::mutex m_d3dCtxMutex;
+    std::thread m_recordingThread;
+    CThreadEvent m_recordingJobReady;
+    std::atomic_bool m_recordingExit { false };
 
     IDRScheduler m_scheduler;
 };

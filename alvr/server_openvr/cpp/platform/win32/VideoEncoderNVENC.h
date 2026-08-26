@@ -29,6 +29,14 @@ public:
         bool insertIDR
     );
 
+    void SubmitFrame(
+        ID3D11Texture2D* pTexture,
+        uint64_t presentationTime,
+        uint64_t targetTimestampNs,
+        bool insertIDR
+    );
+    void DrainFrame();
+
 private:
     void FillEncodeConfig(
         NV_ENC_INITIALIZE_PARAMS& initializeParams,
@@ -49,4 +57,6 @@ private:
     int m_renderHeight;
     int m_bitrateInMBits;
     bool m_recordingSink;
+    uint64_t m_pendingTimestampNs = 0;
+    bool m_pendingIdr = false;
 };

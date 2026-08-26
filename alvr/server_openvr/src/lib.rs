@@ -25,7 +25,7 @@ use alvr_filesystem as afs;
 use alvr_packets::{ButtonValue, Haptics};
 use alvr_server_core::{
     HandType, ServerCoreContext, ServerCoreEvent, ServerNegotiatedStreamingConfig,
-    recording_max_fps,
+    recording_max_dimension, recording_max_fps, recording_pipeline_slots,
 };
 use alvr_session::{
     BodyTrackingSinkConfig, CodecType, ControllersConfig, ControllersEmulationMode,
@@ -578,6 +578,42 @@ extern "C" fn get_recording_max_fps() -> f32 {
     recording_max_fps()
 }
 
+#[unsafe(export_name = "GetRecordingPipelineSlots")]
+extern "C" fn get_recording_pipeline_slots() -> u32 {
+    recording_pipeline_slots()
+}
+
+#[unsafe(export_name = "GetRecordingEncodeSize")]
+extern "C" fn get_recording_encode_size(
+    src_w: i32,
+    src_h: i32,
+    codec: i32,
+    out_w: *mut i32,
+    out_h: *mut i32,
+) {
+    if out_w.is_null() || out_h.is_null() {
+        return;
+    }
+    let h264 = codec == 0;
+    let (w, h) = alvr_server_core::recording_encode_size(
+        src_w.max(1) as u32,
+        src_h.max(1) as u32,
+        recording_max_dimension(),
+        h264,
+    );
+    unsafe {
+        *out_w = w as i32;
+        *out_h = h as i32;
+    }
+}
+
+#[unsafe(export_name = "NoteRecordingFrameSubmit")]
+extern "C" fn note_recording_frame_submit() {
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        context.note_recording_frame_submit();
+    }
+}
+
 #[unsafe(export_name = "SetRecordingVideoConfigNals")]
 extern "C" fn set_recording_video_config_nals(buffer_ptr: *const u8, len: i32, _codec: i32) {
     if len <= 0 {
@@ -586,7 +622,7 @@ extern "C" fn set_recording_video_config_nals(buffer_ptr: *const u8, len: i32, _
     let mut config_buffer = vec![0; len as usize];
     unsafe { ptr::copy_nonoverlapping(buffer_ptr, config_buffer.as_mut_ptr(), len as usize) };
     if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
-        context.send_recording_video(config_buffer);
+        context.send_recording_video_config(config_buffer);
     }
 }
 

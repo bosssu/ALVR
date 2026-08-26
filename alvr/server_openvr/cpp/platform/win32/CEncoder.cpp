@@ -1,4 +1,5 @@
 #include "CEncoder.h"
+#include "NvEncoder.h"
 
 #include "ALVR-common/packet_types.h"
 #include "alvr_server/Logger.h"
@@ -14,6 +15,7 @@
 #include <chrono>
 #include <filesystem>
 #include <iomanip>
+#include <mutex>
 #include <objbase.h>
 #include <oleauto.h>
 #include <sstream>
@@ -28,12 +30,18 @@ CEncoder::CEncoder()
 }
 
 CEncoder::~CEncoder() {
+    m_wantRecordingEncode.store(false);
+    WaitRecordingIdle();
+    StopRecordingWorker();
     if (m_recordingEncoder) {
         m_recordingEncoder->Shutdown();
         m_recordingEncoder.reset();
     }
     m_recordingBlit.reset();
     m_recordingScaled.Reset();
+    for (int i = 0; i < kRecordingMaxSlots; ++i) {
+        m_recordingSlots[i].Reset();
+    }
     if (m_videoEncoder) {
         m_videoEncoder->Shutdown();
         m_videoEncoder.reset();
@@ -141,6 +149,7 @@ bool CEncoder::CopyToStaging(
     m_targetTimestampNs = targetTimestampNs;
     m_FrameRender->Startup();
 
+    std::lock_guard<std::mutex> lock(m_d3dCtxMutex);
     m_FrameRender->RenderFrame(
         pTexture, bounds, poses, layerCount, recentering, message, debugText
     );
@@ -150,12 +159,14 @@ bool CEncoder::CopyToStaging(
 void CEncoder::Run() {
     Debug("CEncoder: Start thread. Id=%d\n", GetCurrentThreadId());
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_MOST_URGENT);
+    EnsureRecordingWorker();
 
     while (!m_bExiting) {
         m_newFrameReady.Wait();
         if (m_bExiting)
             break;
 
+        bool queuedRecording = false;
         if (m_FrameRender->GetTexture()) {
             if (m_captureFrame.exchange(false)) {
                 if (auto shot = m_FrameRender->GetScreenshotTexture()) {
@@ -177,29 +188,72 @@ void CEncoder::Run() {
                             drop = true;
                         }
                     }
+                    const unsigned inFlight = m_recordingInFlight.load();
+                    const unsigned maxSlots
+                        = m_recordingSlotCount > 0 ? (unsigned)m_recordingSlotCount : 1u;
+                    if (!drop && inFlight >= maxSlots) {
+                        drop = true;
+                    }
                     if (!drop) {
                         ID3D11Texture2D* src = shot.Get();
-                        if (m_recordingBlit && m_recordingScaled) {
-                            m_recordingBlit->Render();
-                            src = m_recordingScaled.Get();
+                        int slot = -1;
+                        {
+                            std::lock_guard<std::mutex> q(m_recordingQueueMutex);
+                            if (!m_recordingFree.empty()) {
+                                slot = m_recordingFree.back();
+                                m_recordingFree.pop_back();
+                            }
                         }
-                        bool idr = m_recordingNeedIdr;
-                        m_recordingNeedIdr = false;
-                        m_lastRecordingKeep = now;
-                        m_hasRecordingKeep = true;
-                        m_recordingEncoder->Transmit(
-                            src, m_presentationTime, m_targetTimestampNs, idr
-                        );
+                        if (slot < 0 || !src || !m_recordingSlots[slot]) {
+                            if (slot >= 0) {
+                                std::lock_guard<std::mutex> q(m_recordingQueueMutex);
+                                m_recordingFree.push_back(slot);
+                            }
+                        } else {
+                            bool idr = m_recordingNeedIdr;
+                            try {
+                                std::lock_guard<std::mutex> lock(m_d3dCtxMutex);
+                                if (m_recordingBlit && m_recordingScaled) {
+                                    m_recordingBlit->Render();
+                                    src = m_recordingScaled.Get();
+                                }
+                                m_d3dRender->GetContext()->CopyResource(
+                                    m_recordingSlots[slot].Get(), src
+                                );
+                                m_recordingNeedIdr = false;
+                                m_lastRecordingKeep = now;
+                                m_hasRecordingKeep = true;
+                                NoteRecordingFrameSubmit();
+                                m_recordingSlotIdr[slot] = idr;
+                                {
+                                    std::lock_guard<std::mutex> q(m_recordingQueueMutex);
+                                    m_recordingJobs.push_back(slot);
+                                }
+                                m_recordingInFlight.fetch_add(1);
+                                queuedRecording = true;
+                            } catch (Exception e) {
+                                Error("Recording copy failed: %s\n", e.what());
+                                std::lock_guard<std::mutex> q(m_recordingQueueMutex);
+                                m_recordingFree.push_back(slot);
+                            }
+                        }
                     }
                 }
             }
 
-            m_videoEncoder->Transmit(
-                m_FrameRender->GetTexture().Get(),
-                m_presentationTime,
-                m_targetTimestampNs,
-                m_scheduler.CheckIDRInsertion()
-            );
+            if (queuedRecording) {
+                m_recordingJobReady.Set();
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(m_d3dCtxMutex);
+                m_videoEncoder->Transmit(
+                    m_FrameRender->GetTexture().Get(),
+                    m_presentationTime,
+                    m_targetTimestampNs,
+                    m_scheduler.CheckIDRInsertion()
+                );
+            }
         }
 
         m_encodeFinished.Set();
@@ -211,12 +265,17 @@ void CEncoder::Stop() {
     m_wantRecordingEncode.store(false);
     m_newFrameReady.Set();
     Join();
+    WaitRecordingIdle();
+    StopRecordingWorker();
     if (m_recordingEncoder) {
         m_recordingEncoder->Shutdown();
         m_recordingEncoder.reset();
     }
     m_recordingBlit.reset();
     m_recordingScaled.Reset();
+    for (int i = 0; i < kRecordingMaxSlots; ++i) {
+        m_recordingSlots[i].Reset();
+    }
     m_FrameRender.reset();
 }
 
@@ -236,27 +295,86 @@ void CEncoder::CaptureFrame() { m_captureFrame = true; }
 void CEncoder::StartRecordingEncode() {
     m_recordingNeedIdr = true;
     m_hasRecordingKeep = false;
+    EnsureRecordingWorker();
     m_wantRecordingEncode.store(true);
 }
 
+void CEncoder::EnsureRecordingWorker() {
+    if (m_recordingThread.joinable()) {
+        return;
+    }
+    m_recordingExit.store(false);
+    m_recordingThread = std::thread([this] { RecordingWorker(); });
+}
+
+void CEncoder::StopRecordingWorker() {
+    m_recordingExit.store(true);
+    m_recordingJobReady.Set();
+    if (m_recordingThread.joinable()) {
+        m_recordingThread.join();
+    }
+}
+
+void CEncoder::WaitRecordingIdle() {
+    for (int i = 0; i < 400 && m_recordingInFlight.load() > 0; ++i) {
+        m_recordingJobReady.Set();
+        Sleep(10);
+    }
+}
+
+void CEncoder::RecordingWorker() {
+    while (!m_recordingExit.load()) {
+        m_recordingJobReady.Wait();
+        if (m_recordingExit.load()) {
+            break;
+        }
+        for (;;) {
+            int slot = -1;
+            bool idr = false;
+            {
+                std::lock_guard<std::mutex> q(m_recordingQueueMutex);
+                if (m_recordingJobs.empty()) {
+                    break;
+                }
+                slot = m_recordingJobs.front();
+                m_recordingJobs.erase(m_recordingJobs.begin());
+                idr = m_recordingSlotIdr[slot];
+            }
+            auto enc = m_recordingEncoder;
+            if (enc && slot >= 0 && m_recordingSlots[slot]) {
+                try {
+                    std::lock_guard<std::mutex> lock(m_d3dCtxMutex);
+                    enc->SubmitFrame(
+                        m_recordingSlots[slot].Get(),
+                        m_presentationTime,
+                        m_targetTimestampNs,
+                        idr
+                    );
+                } catch (Exception e) {
+                    Error("Recording submit failed: %s\n", e.what());
+                } catch (NVENCException e) {
+                    Error("Recording NVENC submit failed: %s\n", e.what());
+                }
+                try {
+                    enc->DrainFrame();
+                } catch (Exception e) {
+                    Error("Recording encode failed: %s\n", e.what());
+                } catch (NVENCException e) {
+                    Error("Recording NVENC failed: %s\n", e.what());
+                }
+            }
+            {
+                std::lock_guard<std::mutex> q(m_recordingQueueMutex);
+                m_recordingFree.push_back(slot);
+            }
+            if (m_recordingInFlight.load() > 0) {
+                m_recordingInFlight.fetch_sub(1);
+            }
+        }
+    }
+}
+
 void CEncoder::StopRecordingEncode() { m_wantRecordingEncode.store(false); }
-
-static int Align32(int v) {
-    v &= ~31;
-    return v < 32 ? 32 : v;
-}
-
-static void FitNvencSize(int srcW, int srcH, int maxDim, int* outW, int* outH) {
-    float scale = 1.0f;
-    if (srcW > maxDim) {
-        scale = (float)maxDim / (float)srcW;
-    }
-    if ((int)(srcH * scale) > maxDim) {
-        scale = (float)maxDim / (float)srcH;
-    }
-    *outW = Align32((int)std::lround((float)srcW * scale));
-    *outH = Align32((int)std::lround((float)srcH * scale));
-}
 
 void CEncoder::SyncRecordingEncoder() {
     const bool want = m_wantRecordingEncode.load();
@@ -275,9 +393,9 @@ void CEncoder::SyncRecordingEncoder() {
         Exception lastErr("no encoder attempted");
         bool started = false;
 
-        auto tryStart = [&](int codec, int maxDim) {
+        auto tryStart = [&](int codec, int /*maxDim*/) {
             int encW = 0, encH = 0;
-            FitNvencSize(srcW, srcH, maxDim, &encW, &encH);
+            GetRecordingEncodeSize(srcW, srcH, codec, &encW, &encH);
             Info(
                 "Starting pre-FFR recording encoder %dx%d (src %dx%d) codec=%d\n",
                 encW,
@@ -293,6 +411,36 @@ void CEncoder::SyncRecordingEncoder() {
 
             m_recordingBlit.reset();
             m_recordingScaled.Reset();
+            {
+                std::lock_guard<std::mutex> q(m_recordingQueueMutex);
+                m_recordingJobs.clear();
+                m_recordingFree.clear();
+                unsigned n = GetRecordingPipelineSlots();
+                if (n < 1) {
+                    n = 1;
+                }
+                if (n > (unsigned)kRecordingMaxSlots) {
+                    n = (unsigned)kRecordingMaxSlots;
+                }
+                m_recordingSlotCount = (int)n;
+                m_recordingInFlight.store(0);
+                DXGI_FORMAT slotFmt = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+                if (shot) {
+                    D3D11_TEXTURE2D_DESC pd {};
+                    shot->GetDesc(&pd);
+                    slotFmt = pd.Format;
+                }
+                for (int i = 0; i < kRecordingMaxSlots; ++i) {
+                    m_recordingSlots[i].Reset();
+                    m_recordingSlotIdr[i] = false;
+                }
+                for (int i = 0; i < m_recordingSlotCount; ++i) {
+                    m_recordingSlots[i].Attach(d3d_render_utils::CreateTexture(
+                        m_d3dRender->GetDevice(), (uint32_t)encW, (uint32_t)encH, slotFmt
+                    ));
+                    m_recordingFree.push_back(i);
+                }
+            }
             if (encW != srcW || encH != srcH) {
                 if (!shot) {
                     throw MakeException("No screenshot texture to scale for recording");
@@ -361,6 +509,9 @@ void CEncoder::SyncRecordingEncoder() {
                 m_recordingEncoder.reset();
                 m_recordingBlit.reset();
                 m_recordingScaled.Reset();
+                for (int i = 0; i < kRecordingMaxSlots; ++i) {
+                    m_recordingSlots[i].Reset();
+                }
             }
         }
         if (!started) {
@@ -372,10 +523,20 @@ void CEncoder::SyncRecordingEncoder() {
         }
     } else if (!want && m_recordingEncoder) {
         Info("Stopping pre-FFR recording encoder\n");
+        WaitRecordingIdle();
         m_recordingEncoder->Shutdown();
         m_recordingEncoder.reset();
         m_recordingBlit.reset();
         m_recordingScaled.Reset();
+        for (int i = 0; i < kRecordingMaxSlots; ++i) {
+            m_recordingSlots[i].Reset();
+        }
+        {
+            std::lock_guard<std::mutex> q(m_recordingQueueMutex);
+            m_recordingJobs.clear();
+            m_recordingFree.clear();
+            m_recordingInFlight.store(0);
+        }
         SetRecordingMuxStreamFallback(false);
     }
 }

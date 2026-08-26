@@ -116,12 +116,16 @@ impl LiveMuxSession {
     }
 
     pub fn push_video(&self, data: &[u8]) {
+        self.push_video_at(data, Instant::now());
+    }
+
+    pub fn push_video_at(&self, data: &[u8], at: Instant) {
         if data.is_empty() {
             return;
         }
         if let Some(tx) = &self.video_tx {
             let _ = tx.send(TimedBytes {
-                at: Instant::now(),
+                at,
                 data: data.to_vec(),
             });
         }
@@ -341,20 +345,32 @@ fn capture_and_mux_worker(
     let video_t0_v = Arc::clone(&video_t0);
     let video_t1_v = Arc::clone(&video_t1);
     let demux_owned = demux.to_string();
+    let picture_pts = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let picture_pts_v = Arc::clone(&picture_pts);
     let v_thread = thread::spawn(move || -> Result<(), String> {
         let mut since_flush = 0u64;
         while let Ok(chunk) = video_rx.recv() {
             if chunk.data.is_empty() {
                 continue;
             }
-            {
-                let mut t0 = video_t0_v.lock().unwrap();
-                if t0.is_none() {
-                    *t0 = Some(chunk.at);
-                }
-                *video_t1_v.lock().unwrap() = Some(chunk.at);
-            }
             let pics = count_coded_pictures(&chunk.data, &demux_owned);
+            if crate::recording_source::should_anchor_video_clock(pics) {
+                let origin = {
+                    let mut t0 = video_t0_v.lock().unwrap();
+                    if t0.is_none() {
+                        *t0 = Some(chunk.at);
+                    }
+                    *video_t1_v.lock().unwrap() = Some(chunk.at);
+                    t0.expect("video origin")
+                };
+                let mut pts = picture_pts_v.lock().unwrap();
+                // One bitstream blob can contain several slices; space extras 1ms apart
+                // so setts N still increases. Real dt is on the first picture of the blob.
+                let base = picture_pts_ms(origin, chunk.at);
+                for i in 0..pics {
+                    pts.push(base.saturating_add(i));
+                }
+            }
             vpic.fetch_add(pics, Ordering::Relaxed);
             video_file
                 .write_all(&chunk.data)
@@ -512,6 +528,17 @@ fn capture_and_mux_worker(
         return Err("no video or audio data captured".into());
     }
 
+    let pts_ms = picture_pts.lock().unwrap().clone();
+    let video_bsf = choose_video_bsf(&pts_ms, fps);
+    if let Some(ref bsf) = video_bsf {
+        info!(
+            "Recording video bsf ({} chars, {} pictures): {:.80}...",
+            bsf.len(),
+            pts_ms.len(),
+            bsf
+        );
+    }
+
     let result = run_ffmpeg_mux(
         &ffmpeg,
         &output_mkv,
@@ -523,12 +550,71 @@ fn capture_and_mux_worker(
         v_bytes > 0,
         a_bytes > 0,
         duration_s,
+        video_bsf.as_deref(),
     );
 
-    let _ = fs::remove_file(&video_tmp);
-    let _ = fs::remove_file(&audio_tmp);
+    match &result {
+        Ok(()) => {
+            let _ = fs::remove_file(&video_tmp);
+            let _ = fs::remove_file(&audio_tmp);
+        }
+        Err(e) => {
+            warn!(
+                "Mux failed ({e}); keeping {} and {}",
+                video_tmp.display(),
+                audio_tmp.display()
+            );
+        }
+    }
 
     result
+}
+
+/// Milliseconds from the first coded picture. Used as MKV 1/1000 timestamps.
+pub(crate) fn picture_pts_ms(origin: Instant, at: Instant) -> u64 {
+    if at <= origin {
+        0
+    } else {
+        at.duration_since(origin).as_millis() as u64
+    }
+}
+
+/// Per-picture VFR `setts` so ffmpeg does not flatten bursts to CFR.
+/// `None` when there are too few timestamps to restamp.
+pub(crate) fn setts_copy_filter(pts_ms: &[u64]) -> Option<String> {
+    if pts_ms.len() < 2 {
+        return None;
+    }
+    let mut terms = String::new();
+    for (i, p) in pts_ms.iter().enumerate() {
+        if i > 0 {
+            terms.push('+');
+        }
+        terms.push_str(&format!("{p}*eq(N,{i})"));
+    }
+    Some(format!(
+        "setts=time_base=1/1000:pts='{terms}':dts='{terms}'"
+    ))
+}
+
+/// Windows ffmpeg (gyan/mingw builds) does not expand `@args` response files
+/// when spawned without a shell — `@path` is treated as the *output* name.
+/// Keep the bsf short enough for CreateProcess; otherwise use CFR from span.
+pub(crate) const MAX_VIDEO_BSF_CHARS: usize = 3000;
+
+pub(crate) fn choose_video_bsf(pts_ms: &[u64], fps: f32) -> Option<String> {
+    if let Some(vfr) = setts_copy_filter(pts_ms) {
+        if vfr.len() <= MAX_VIDEO_BSF_CHARS {
+            return Some(vfr);
+        }
+    }
+    if fps.is_finite() && fps >= 1.0 {
+        Some(format!(
+            "setts=pts=N/{fps:.6}/TB:dts=N/{fps:.6}/TB"
+        ))
+    } else {
+        None
+    }
 }
 
 pub(crate) fn mux_fps_from_pictures(pictures: u64, span: Duration, fallback_fps: f32) -> f32 {
@@ -625,6 +711,7 @@ fn run_ffmpeg_mux(
     has_video: bool,
     has_audio: bool,
     duration_s: f64,
+    video_bsf: Option<&str>,
 ) -> Result<(), String> {
     let mut cmd = Command::new(ffmpeg);
     cmd.arg("-hide_banner")
@@ -658,15 +745,13 @@ fn run_ffmpeg_mux(
         cmd.arg("-c:v").arg("copy");
     }
     if has_audio {
-        // Lossless PCM in MKV (same idea as previous live path).
         cmd.arg("-c:a").arg("pcm_s16le");
     }
 
-    if has_video && fps.is_finite() && fps >= 1.0 {
-        // NVENC VUI still says the cap (e.g. 30). Players would then run 24
-        // pictures/s at 30 fps. Rewrite packet PTS to the actual picture rate.
-        cmd.arg("-bsf:v")
-            .arg(format!("setts=pts=N/{fps:.6}/TB:dts=N/{fps:.6}/TB"));
+    if has_video {
+        if let Some(bsf) = video_bsf {
+            cmd.arg("-bsf:v").arg(bsf);
+        }
     }
     let mux_tmp = output_mkv.with_extension("muxing.mkv");
     let _ = fs::remove_file(&mux_tmp);
@@ -683,8 +768,9 @@ fn run_ffmpeg_mux(
     }
 
     info!(
-        "Recording ffmpeg: {} -f {demux} -framerate {fps:.4} -c:v copy setts={fps:.4}Hz duration_hint={duration_s:.3}s -> {}",
+        "Recording ffmpeg: {} -f {demux} -framerate {fps:.4} -c:v copy bsf={} duration_hint={duration_s:.3}s -> {}",
         ffmpeg.display(),
+        video_bsf.is_some(),
         output_mkv.display()
     );
 
@@ -764,6 +850,46 @@ mod tests {
             (26.5..=27.5).contains(&fps),
             "expected ~27 fps from 270 pictures in 10s, got {fps}"
         );
+    }
+
+    #[test]
+    fn vfr_setts_preserves_a_stall_gap() {
+        let filter = setts_copy_filter(&[0, 50, 200, 250]).expect("filter");
+        assert!(filter.contains("200*eq(N,2)"));
+        assert!(filter.contains("time_base=1/1000"));
+        assert!(!filter.contains("N/"));
+    }
+
+    #[test]
+    fn vfr_setts_skips_single_picture() {
+        assert!(setts_copy_filter(&[0]).is_none());
+        assert!(setts_copy_filter(&[]).is_none());
+    }
+
+    #[test]
+    fn short_take_uses_vfr_setts() {
+        let bsf = choose_video_bsf(&[0, 50, 200, 250], 30.0).unwrap();
+        assert!(bsf.contains("200*eq(N,2)"));
+        assert!(!bsf.starts_with('@'));
+    }
+
+    #[test]
+    fn long_take_falls_back_to_cfr_setts_not_argfile() {
+        let pts: Vec<u64> = (0..2000).map(|i| i * 50).collect();
+        let vfr = setts_copy_filter(&pts).unwrap();
+        assert!(vfr.len() > MAX_VIDEO_BSF_CHARS);
+        let bsf = choose_video_bsf(&pts, 20.0).unwrap();
+        assert!(bsf.starts_with("setts=pts=N/"));
+        assert!(!bsf.contains('@'));
+        assert!(bsf.len() < 200);
+    }
+
+    #[test]
+    fn picture_pts_ms_is_zero_at_origin() {
+        let t0 = Instant::now();
+        assert_eq!(picture_pts_ms(t0, t0), 0);
+        let later = t0 + Duration::from_millis(40);
+        assert_eq!(picture_pts_ms(t0, later), 40);
     }
 
     #[test]

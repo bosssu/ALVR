@@ -40,7 +40,7 @@ use alvr_sockets::StreamSender;
 use bitrate::{BitrateManager, DynamicEncoderParams};
 use statistics::StatisticsManager;
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     env,
     ffi::OsStr,
     path::PathBuf,
@@ -130,6 +130,8 @@ pub struct ConnectionContext {
     /// Stream-copy mux already wrote decoder SPS/PPS for this take.
     pub(crate) recording_stream_config_prefixed: AtomicBool,
     pub(crate) recording_last_kept: Mutex<Option<Instant>>,
+    /// Submit Instants (encoder thread) popped when NALs arrive from the async recorder.
+    pub(crate) recording_submit_instants: Mutex<VecDeque<Instant>>,
     pub(crate) feedback_sounds: feedback_sounds::FeedbackSounds,
     connection_threads: Mutex<Vec<JoinHandle<()>>>,
     clients_to_be_removed: Mutex<HashSet<String>>,
@@ -197,6 +199,7 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
                 .recording_stream_config_prefixed
                 .store(false, Ordering::Relaxed);
             *connection_context.recording_last_kept.lock() = None;
+            connection_context.recording_submit_instants.lock().clear();
             *connection_context.audio_tee_tx.lock() = Some(session.audio_sender());
             *connection_context.live_recording.lock() = Some(session);
 
@@ -233,6 +236,7 @@ pub fn stop_recording_with_feedback(connection_context: &ConnectionContext, play
         .recording_stream_config_prefixed
         .store(false, Ordering::Relaxed);
     *connection_context.recording_last_kept.lock() = None;
+    connection_context.recording_submit_instants.lock().clear();
     *connection_context.audio_tee_tx.lock() = None;
     if let Some(session) = connection_context.live_recording.lock().take() {
         // Never block the hotkey / SteamVR path on ffmpeg flush — finish in background.
@@ -296,6 +300,24 @@ pub fn recording_max_fps() -> f32 {
         .extra
         .capture
         .recording_max_fps
+}
+
+/// 0 = no extra cap (codec limit only). Default 1920.
+pub fn recording_max_dimension() -> u32 {
+    SESSION_MANAGER
+        .read()
+        .settings()
+        .extra
+        .capture
+        .recording_max_dimension
+}
+
+pub fn recording_encode_size(src_w: u32, src_h: u32, user_max_dim: u32, h264: bool) -> (u32, u32) {
+    recording_source::recording_encode_size(src_w, src_h, user_max_dim, h264)
+}
+
+pub fn recording_pipeline_slots() -> u32 {
+    recording_source::RECORDING_PIPELINE_SLOTS
 }
 
 pub fn steamvr_hmd_init_config() -> SteamvrHmdInitConfig {
@@ -369,6 +391,7 @@ impl ServerCoreContext {
             recording_pre_ffr_nals: AtomicBool::new(false),
             recording_stream_config_prefixed: AtomicBool::new(false),
             recording_last_kept: Mutex::new(None),
+            recording_submit_instants: Mutex::new(VecDeque::new()),
             feedback_sounds: feedback_sounds::FeedbackSounds::start(),
             connection_threads: Mutex::new(Vec::new()),
             clients_to_be_removed: Mutex::new(HashSet::new()),
@@ -544,7 +567,32 @@ impl ServerCoreContext {
         });
     }
 
+    pub fn note_recording_frame_submit(&self) {
+        self.connection_context
+            .recording_submit_instants
+            .lock()
+            .push_back(Instant::now());
+    }
+
     pub fn send_recording_video(&self, buffer: Vec<u8>) {
+        if buffer.is_empty() {
+            return;
+        }
+        self.connection_context
+            .recording_pre_ffr_nals
+            .store(true, Ordering::Relaxed);
+        let at = self
+            .connection_context
+            .recording_submit_instants
+            .lock()
+            .pop_front()
+            .unwrap_or_else(Instant::now);
+        if let Some(rec) = &*self.connection_context.live_recording.lock() {
+            rec.push_video_at(&buffer, at);
+        }
+    }
+
+    pub fn send_recording_video_config(&self, buffer: Vec<u8>) {
         if buffer.is_empty() {
             return;
         }

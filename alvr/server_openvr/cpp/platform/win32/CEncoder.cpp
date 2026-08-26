@@ -2,12 +2,15 @@
 
 #include "alvr_server/Logger.h"
 #include "alvr_server/Settings.h"
+#include "alvr_server/Utils.h"
+#include "alvr_server/bindings.h"
 
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <iomanip>
 #include <objbase.h>
+#include <oleauto.h>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -290,16 +293,11 @@ void CEncoder::SaveScreenshotPng(ID3D11Texture2D* texture) {
             return;
         }
 
-        auto now = std::chrono::system_clock::now();
-        auto t = std::chrono::system_clock::to_time_t(now);
-        std::tm tm {};
-        localtime_s(&tm, &t);
-        std::ostringstream name;
-        name << dir << "\\screenshot." << std::put_time(&tm, "%Y-%m-%d.%H-%M-%S") << ".png";
-        const std::string pathUtf8 = name.str();
+        const std::string pathUtf8
+            = FormatCaptureFilePath(dir, "screenshot", "jpg", GetHeadsetHFovDeg());
         const std::wstring wpath = Utf8ToWide(pathUtf8);
 
-        // PNG encode off the encoder thread so we don't stall the VR frame loop.
+        // JPEG encode off the encoder thread so we don't stall the VR frame loop.
         busy_guard.release_early = false;
         std::thread([pixels = std::move(pixels),
                      width,
@@ -347,10 +345,10 @@ void CEncoder::SaveScreenshotPng(ID3D11Texture2D* texture) {
                 }
 
                 ComPtr<IWICBitmapEncoder> encoder;
-                hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+                hr = factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &encoder);
                 if (FAILED(hr)
                     || FAILED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache))) {
-                    Error("Screenshot: PNG encoder init failed\n");
+                    Error("Screenshot: JPEG encoder init failed\n");
                     cleanup();
                     return;
                 }
@@ -358,38 +356,51 @@ void CEncoder::SaveScreenshotPng(ID3D11Texture2D* texture) {
                 ComPtr<IWICBitmapFrameEncode> frame;
                 ComPtr<IPropertyBag2> props;
                 hr = encoder->CreateNewFrame(&frame, &props);
-                if (FAILED(hr) || FAILED(frame->Initialize(props.Get()))) {
+                if (FAILED(hr)) {
+                    Error("Screenshot: frame create failed\n");
+                    cleanup();
+                    return;
+                }
+                if (props) {
+                    PROPBAG2 opt {};
+                    opt.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
+                    VARIANT val;
+                    VariantInit(&val);
+                    val.vt = VT_R4;
+                    val.fltVal = 0.92f;
+                    props->Write(1, &opt, &val);
+                    VariantClear(&val);
+                }
+                if (FAILED(frame->Initialize(props.Get()))) {
                     Error("Screenshot: frame init failed\n");
                     cleanup();
                     return;
                 }
 
                 frame->SetSize(width, height);
-                WICPixelFormatGUID format = GUID_WICPixelFormat32bppRGBA;
+                WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
                 frame->SetPixelFormat(&format);
 
-                std::vector<uint8_t> packed(static_cast<size_t>(width) * height * 4);
+                std::vector<uint8_t> packed(static_cast<size_t>(width) * height * 3);
                 for (UINT y = 0; y < height; ++y) {
                     const uint8_t* src = pixels.data() + static_cast<size_t>(y) * rowPitch;
-                    uint8_t* dst = packed.data() + static_cast<size_t>(y) * width * 4;
+                    uint8_t* dst = packed.data() + static_cast<size_t>(y) * width * 3;
                     for (UINT x = 0; x < width; ++x) {
-                        if (isBgra) {
-                            dst[x * 4 + 0] = src[x * 4 + 2];
-                            dst[x * 4 + 1] = src[x * 4 + 1];
-                            dst[x * 4 + 2] = src[x * 4 + 0];
-                            dst[x * 4 + 3] = src[x * 4 + 3];
-                        } else {
-                            memcpy(dst + x * 4, src + x * 4, 4);
-                        }
+                        const uint8_t r = isBgra ? src[x * 4 + 2] : src[x * 4 + 0];
+                        const uint8_t g = src[x * 4 + 1];
+                        const uint8_t b = isBgra ? src[x * 4 + 0] : src[x * 4 + 2];
+                        dst[x * 3 + 0] = b;
+                        dst[x * 3 + 1] = g;
+                        dst[x * 3 + 2] = r;
                     }
                 }
 
-                const UINT stride = width * 4;
+                const UINT stride = width * 3;
                 hr = frame->WritePixels(
                     height, stride, static_cast<UINT>(packed.size()), packed.data()
                 );
                 if (FAILED(hr) || FAILED(frame->Commit()) || FAILED(encoder->Commit())) {
-                    Error("Screenshot: write PNG failed for %s\n", pathUtf8.c_str());
+                    Error("Screenshot: write JPEG failed for %s\n", pathUtf8.c_str());
                 } else {
                     Info("Screenshot saved: %s\n", pathUtf8.c_str());
                 }

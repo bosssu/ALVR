@@ -23,6 +23,8 @@
 #include "FrameRender.h"
 #include "alvr_server/Logger.h"
 #include "alvr_server/PoseHistory.h"
+#include "alvr_server/Settings.h"
+#include "alvr_server/Utils.h"
 #include "alvr_server/bindings.h"
 #include "ffmpeg_helper.h"
 #include "protocol.h"
@@ -237,15 +239,12 @@ void CEncoder::Run() {
 
             if (m_captureFrame) {
                 m_captureFrame = false;
-                auto now = std::chrono::system_clock::now();
-                auto t = std::chrono::system_clock::to_time_t(now);
-                std::tm tm {};
-                localtime_r(&t, &tm);
-                std::ostringstream name;
-                name << std::string(Settings_Instance()->m_captureFrameDir) << "/screenshot."
-                     << std::put_time(&tm, "%Y-%m-%d.%H-%M-%S");
-                // dumpImage writes PPM; keep extension for the raw dump path
-                render.CaptureOutputFrame(name.str() + ".ppm");
+                std::string dir = Settings_Instance()->m_captureFrameDir;
+                std::string path = FormatCaptureFilePath(
+                    dir, "screenshot", "ppm", GetHeadsetHFovDeg()
+                );
+                // dumpImage writes PPM
+                render.CaptureOutputFrame(path);
             }
 
             render.Render(frame_info.image, frame_info.semaphore_value);

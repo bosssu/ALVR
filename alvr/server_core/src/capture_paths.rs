@@ -24,11 +24,22 @@ pub fn program_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Base name without extension. Use underscores so `Path::with_extension` does not
-/// treat the time segment as an extension (e.g. `recording.2026-07-13.12-00-00`
-/// + with_extension("h264") wrongly became `recording.2026-07-13.h264`).
-pub fn recording_stem(now: chrono::DateTime<chrono::Local>) -> String {
-    format!("recording_{}", now.format("%Y-%m-%d_%H-%M-%S"))
+/// Horizontal FOV in degrees from one eye's left/right half-angles (radians).
+pub fn horizontal_fov_deg(left_rad: f32, right_rad: f32) -> f32 {
+    (left_rad.abs() + right_rad.abs()).to_degrees()
+}
+
+/// Base name without extension: `{kind}_{YYYYMMDD}_{HHMMSS}_FOV_{deg}`.
+pub fn capture_stem(kind: &str, now: chrono::DateTime<chrono::Local>, fov_deg: f32) -> String {
+    format!("{}_{}_FOV_{:.6}", kind, now.format("%Y%m%d_%H%M%S"), fov_deg)
+}
+
+pub fn recording_stem(now: chrono::DateTime<chrono::Local>, fov_deg: f32) -> String {
+    capture_stem("recording", now, fov_deg)
+}
+
+pub fn screenshot_stem(now: chrono::DateTime<chrono::Local>, fov_deg: f32) -> String {
+    capture_stem("screenshot", now, fov_deg)
 }
 
 /// Append a media extension without using `Path::with_extension` (safe with dotted names).
@@ -73,16 +84,19 @@ mod tests {
             .with_ymd_and_hms(2026, 7, 13, 14, 30, 45)
             .single()
             .expect("valid local time");
-        let stem_name = recording_stem(now);
-        assert_eq!(stem_name, "recording_2026-07-13_14-30-45");
+        let stem_name = recording_stem(now, 103.976959);
+        assert_eq!(stem_name, "recording_20260713_143045_FOV_103.976959");
 
-        let video = with_media_ext(Path::new(&stem_name), "h264");
+        let video = with_media_ext(Path::new(&stem_name), "mkv");
         assert_eq!(
             video.to_string_lossy(),
-            "recording_2026-07-13_14-30-45.h264"
+            "recording_20260713_143045_FOV_103.976959.mkv"
         );
-        let wav = with_media_ext(Path::new(&stem_name), "wav");
-        assert_eq!(wav.to_string_lossy(), "recording_2026-07-13_14-30-45.wav");
+        let shot = with_media_ext(Path::new(&screenshot_stem(now, 103.976959)), "jpg");
+        assert_eq!(
+            shot.to_string_lossy(),
+            "screenshot_20260713_143045_FOV_103.976959.jpg"
+        );
     }
 
     #[test]

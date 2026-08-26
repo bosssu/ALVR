@@ -5,7 +5,7 @@ pub fn debug_tab_ui(ui: &mut Ui) -> Option<ServerRequest> {
     let mut request = None;
 
     ui.label(
-        "Capture frame saves an SBS PNG into the configured screenshot folder (default Captures/Captures).
+        "Capture frame saves an SBS JPEG into the configured screenshot folder (default Captures/Captures).
 Start/Stop recording captures bitstream + game audio and remuxes a lossless MKV (via ffmpeg) into Captures/Records.
 Global hotkeys (default F8 screenshot / F9 toggle recording) work while the ALVR SteamVR driver is running.
 Requires ffmpeg on PATH or deps/windows/ffmpeg/bin.",

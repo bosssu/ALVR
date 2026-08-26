@@ -51,6 +51,52 @@ This is a fork of [ALVR](https://github.com/polygraphene/ALVR).
     -   802.11ac 5 GHz Wi-Fi for the headset, and wired Ethernet for the PC is recommended.
     -   The PC and the headset must be connected to the same router (or use a routed connection as described [here](https://github.com/alvr-org/ALVR/wiki/ALVR-v14-and-Above)).
 
+## Capture: screenshot and recording
+
+PC-side capture runs in the **SteamVR driver process**. SteamVR + ALVR must be running. Global hotkeys work even when Dashboard is not focused.
+
+### Screenshot (SBS JPEG)
+
+- Default hotkey: **F8** (configurable).
+- Dashboard: **Debug** tab → **Capture frame**.
+- Output: side-by-side stereo RGB JPEG (after color correction, before FFR/YUV).
+- Default folder: `Captures/Captures/` under the streamer root (same folder as `ALVR Dashboard.exe`).
+- Filename: `screenshot_YYYYMMDD_HHMMSS_FOV_{horizontalDegrees}.jpg` (FOV is the connected headset's horizontal FOV in degrees).
+- A short shutter sound plays if feedback sounds are enabled.
+
+### Video recording (MKV)
+
+- Default hotkey: **F9** — same key **toggles start / stop**.
+- Dashboard: **Debug** tab → **Start recording** / **Stop recording**.
+- Optional: **Extra → Capture → Start video recording at client connection**.
+- Captures the encoded bitstream plus **game audio** (loopback, not microphone), then remuxes a lossless MKV via ffmpeg when you stop.
+- Default folder: `Captures/Records/`.
+- Filename: `recording_YYYYMMDD_HHMMSS_FOV_{horizontalDegrees}.mkv`.
+- Distinct start / stop beeps if feedback sounds are enabled.
+- Stop does not block SteamVR; ffmpeg remux finishes in the background.
+
+**ffmpeg is required** for MKV recording. Put `ffmpeg` on `PATH`, or use `deps/windows/ffmpeg/bin/ffmpeg.exe` (dev tree) / `bin/win64/ffmpeg.exe` next to the streamer.
+
+### Settings (`Extra` → `Capture`)
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| Enable global hotkeys | on | Master switch |
+| Screenshot hotkey | `F8` | `Ctrl` / `Alt` / `Shift` / `Win` + key, e.g. `Ctrl+F8`, `PrintScreen` |
+| Recording hotkey | `F9` | Toggle start/stop |
+| Feedback sounds | on | Screenshot / rec start / rec stop |
+| Recording folder | `Captures/Records` | Relative to streamer root, or absolute |
+| Screenshot folder | `Captures/Captures` | Relative to streamer root, or absolute |
+| Rolling video files | off | Split files by duration (debug / bug reports) |
+
+Do not bind screenshot and recording to the same key. Screenshot folder changes need a SteamVR restart.
+
+### Older dual-file captures
+
+Older builds wrote `recording.*.h264|h265|av1` plus a sidecar `.wav`. Current builds write MKV directly.
+
+To remux leftover pairs, copy `mux-recordings.bat` to the streamer root (or keep it at the repo root) and double-click it. It looks for `Captures/Records`, muxes matching video + wav with stream copy, and skips files that already have an `.mkv`.
+
 ## Installation
 
 Follow the [installation guide](https://github.com/alvr-org/ALVR/wiki/Installation-guide).

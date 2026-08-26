@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <ctime>
 #ifdef _WIN32
 #pragma warning(disable : 4005)
 #include <winsock2.h>
@@ -21,7 +22,9 @@
 #include <string.h>
 #endif
 
+#include <iomanip>
 #include <math.h>
+#include <sstream>
 
 #include "ALVR-common/packet_types.h"
 #include "openvr_driver_wrap.h"
@@ -68,6 +71,31 @@ inline vr::HmdQuaternion_t HmdQuaternion_Init(double w, double x, double y, doub
     quat.y = y;
     quat.z = z;
     return quat;
+}
+
+inline std::string FormatCaptureFilePath(
+    const std::string& dir, const char* kind, const char* ext, float fovDeg
+) {
+    auto now = std::chrono::system_clock::now();
+    auto t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm {};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    std::ostringstream name;
+    name << dir;
+    if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') {
+#ifdef _WIN32
+        name << '\\';
+#else
+        name << '/';
+#endif
+    }
+    name << kind << '_' << std::put_time(&tm, "%Y%m%d_%H%M%S") << "_FOV_" << std::fixed
+         << std::setprecision(6) << fovDeg << '.' << ext;
+    return name.str();
 }
 
 inline vr::HmdRect2_t fov_to_tangents(FfiFov fov) {

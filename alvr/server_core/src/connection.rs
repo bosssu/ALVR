@@ -37,7 +37,11 @@ use std::{
     hash::{Hash, Hasher},
     net::{IpAddr, Ipv4Addr},
     process::Command,
-    sync::{Arc, mpsc::RecvTimeoutError},
+    sync::{
+        Arc,
+        atomic::Ordering,
+        mpsc::RecvTimeoutError,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -1247,6 +1251,12 @@ fn connection_pipeline(
                         ctx.events_sender.send(ServerCoreEvent::RequestIDR).ok();
                     }
                     ClientControlPacket::LocalViewParams(params) => {
+                        let hfov = crate::capture_paths::horizontal_fov_deg(
+                            params[0].fov.left,
+                            params[0].fov.right,
+                        );
+                        ctx.last_h_fov_deg_bits
+                            .store(hfov.to_bits(), Ordering::Relaxed);
                         ctx.events_sender
                             .send(ServerCoreEvent::LocalViewParams(params))
                             .ok();

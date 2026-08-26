@@ -245,6 +245,7 @@ extern "C" void ShutdownOpenvrClient();
 extern "C" void SetChaperoneArea(float areaWidth, float areaHeight);
 
 extern "C" void CaptureFrame();
+extern "C" float GetHeadsetHFovDeg();
 
 // NalParsing.cpp
 void ParseFrameNals(

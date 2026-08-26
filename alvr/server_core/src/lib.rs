@@ -120,6 +120,8 @@ pub struct ConnectionContext {
     pub(crate) audio_tee_tx: Mutex<Option<flume::Sender<Vec<u8>>>>,
     /// Live loopback rate from the game-audio capture stream (updated when stream starts).
     pub(crate) game_audio_sample_rate: AtomicU32,
+    /// Last connected-headset horizontal FOV in degrees, stored as f32 bits.
+    pub(crate) last_h_fov_deg_bits: AtomicU32,
     pub(crate) feedback_sounds: feedback_sounds::FeedbackSounds,
     connection_threads: Mutex<Vec<JoinHandle<()>>>,
     clients_to_be_removed: Mutex<HashSet<String>>,
@@ -149,7 +151,12 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
         return;
     }
 
-    let stem = dir.join(capture_paths::recording_stem(chrono::Local::now()));
+    let fov_deg = f32::from_bits(
+        connection_context
+            .last_h_fov_deg_bits
+            .load(Ordering::Relaxed),
+    );
+    let stem = dir.join(capture_paths::recording_stem(chrono::Local::now(), fov_deg));
     let output_mkv = capture_paths::with_media_ext(&stem, "mkv");
 
     connection_context.feedback_sounds.play(
@@ -311,6 +318,7 @@ impl ServerCoreContext {
             live_recording: Mutex::new(None),
             audio_tee_tx: Mutex::new(None),
             game_audio_sample_rate: AtomicU32::new(48000),
+            last_h_fov_deg_bits: AtomicU32::new(0.0f32.to_bits()),
             feedback_sounds: feedback_sounds::FeedbackSounds::start(),
             connection_threads: Mutex::new(Vec::new()),
             clients_to_be_removed: Mutex::new(HashSet::new()),

@@ -564,6 +564,12 @@ extern "C" fn send_haptics(device_id: u64, duration_s: f32, frequency: f32, ampl
     }
 }
 
+#[unsafe(export_name = "GetHeadsetHFovDeg")]
+extern "C" fn get_headset_h_fov_deg() -> f32 {
+    let fov = LOCAL_VIEW_PARAMS.read()[0].fov;
+    (fov.left.abs() + fov.right.abs()).to_degrees()
+}
+
 #[unsafe(export_name = "SetVideoConfigNals")]
 extern "C" fn set_video_config_nals(buffer_ptr: *const u8, len: i32, codec: i32) {
     let codec = if codec == 0 {

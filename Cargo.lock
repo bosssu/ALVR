@@ -249,9 +249,11 @@ dependencies = [
  "alvr_system_info",
  "eframe",
  "env_logger",
+ "ico",
  "rand 0.10.1",
  "serde",
  "serde_json",
+ "winres",
 ]
 
 [[package]]

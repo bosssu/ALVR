@@ -11,12 +11,14 @@ use alvr_packets::{FaceData, TrackingData};
 use alvr_session::CodecType;
 use eframe::{
     Frame, NativeOptions, Renderer,
-    egui::{CentralPanel, RichText, Slider, Ui, ViewportBuilder},
+    egui::{self, CentralPanel, IconData, RichText, Slider, Ui, ViewportBuilder},
 };
+use ico::IconDir;
 use serde::{Deserialize, Serialize};
 use std::{
     f32::consts::{FRAC_PI_2, PI},
     fs,
+    io::Cursor,
     path::PathBuf,
     sync::{
         Arc,
@@ -37,6 +39,9 @@ struct WindowInput {
     emulated_decode_ms: u64,
     emulated_compositor_ms: u64,
     emulated_vsync_ms: u64,
+    /// Per-eye default/max advertised to the server (32-aligned).
+    view_width: u32,
+    view_height: u32,
 }
 
 impl Default for WindowInput {
@@ -50,8 +55,14 @@ impl Default for WindowInput {
             emulated_decode_ms: 5,
             emulated_compositor_ms: 1,
             emulated_vsync_ms: 25,
+            view_width: 1920,
+            view_height: 1832,
         }
     }
+}
+
+fn align32_u32(v: u32) -> u32 {
+    v.max(32) & !31
 }
 
 fn settings_path() -> PathBuf {
@@ -103,9 +114,10 @@ impl Default for WindowOutput {
 
 pub struct Window {
     input: WindowInput,
-    input_sender: mpsc::Sender<WindowInput>,
+    input_sender: Option<mpsc::Sender<WindowInput>>,
     output: WindowOutput,
     output_receiver: mpsc::Receiver<WindowOutput>,
+    shutting_down: Arc<RelaxedAtomic>,
 }
 
 impl Window {
@@ -113,19 +125,33 @@ impl Window {
         input: WindowInput,
         input_sender: mpsc::Sender<WindowInput>,
         output_receiver: mpsc::Receiver<WindowOutput>,
+        shutting_down: Arc<RelaxedAtomic>,
     ) -> Self {
         let _ = input_sender.send(input.clone());
         Self {
             input,
-            input_sender,
+            input_sender: Some(input_sender),
             output: WindowOutput::default(),
             output_receiver,
+            shutting_down,
         }
+    }
+
+    /// Drop the UI->client channel, then kill the process so the handshake
+    /// listener (port 9943) and mdns-sd threads cannot outlive the window.
+    fn quit_process(&mut self) {
+        self.shutting_down.set(true);
+        self.input_sender.take();
+        std::process::exit(0);
     }
 }
 
 impl eframe::App for Window {
     fn ui(&mut self, ui: &mut Ui, _: &mut Frame) {
+        if ui.input(|i| i.viewport().close_requested()) {
+            self.quit_process();
+        }
+
         while let Ok(output) = self.output_receiver.try_recv() {
             self.output = output;
         }
@@ -139,12 +165,35 @@ impl eframe::App for Window {
             ui.label(format!("Connected: {}", self.output.connected));
             ui.label(format!("FPS: {}", self.output.fps));
             ui.label(format!("View resolution: {}", self.output.resolution));
+            ui.label(format!(
+                "Advertised max (restart mock to apply): {}x{}",
+                align32_u32(self.input.view_width),
+                align32_u32(self.input.view_height)
+            ));
             ui.label(format!("Codec: {:?}", self.output.decoder_codec));
             ui.label(format!(
                 "Current frame: {:?}",
                 self.output.current_frame_timestamp
             ));
             ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label("View width:");
+                ui.add(
+                    egui::DragValue::new(&mut input.view_width)
+                        .range(32..=8192)
+                        .speed(32)
+                        .suffix(" px"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("View height:");
+                ui.add(
+                    egui::DragValue::new(&mut input.view_height)
+                        .range(32..=8192)
+                        .speed(32)
+                        .suffix(" px"),
+                );
+            });
             ui.horizontal(|ui| {
                 ui.label("Height:");
                 ui.add(Slider::new(&mut input.height, 0.0..=2.0));
@@ -168,9 +217,13 @@ impl eframe::App for Window {
         });
 
         if input != self.input {
+            input.view_width = align32_u32(input.view_width);
+            input.view_height = align32_u32(input.view_height);
             self.input = input;
             save_window_input(&self.input);
-            self.input_sender.send(self.input.clone()).ok();
+            if let Some(sender) = &self.input_sender {
+                sender.send(self.input.clone()).ok();
+            }
         }
 
         ui.request_repaint();
@@ -257,11 +310,16 @@ fn client_thread(
     output_sender: mpsc::Sender<WindowOutput>,
     input_receiver: mpsc::Receiver<WindowInput>,
     initial_input: WindowInput,
+    shutting_down: Arc<RelaxedAtomic>,
 ) {
+    let view = UVec2::new(
+        align32_u32(initial_input.view_width),
+        align32_u32(initial_input.view_height),
+    );
     let capabilities = ClientCapabilities {
         platform: alvr_system_info::platform(None, None),
-        default_view_resolution: UVec2::new(1920, 1832),
-        max_view_resolution: UVec2::new(1920, 1832),
+        default_view_resolution: view,
+        max_view_resolution: view,
         refresh_rates: vec![60.0, 72.0, 80.0, 90.0, 120.0],
         foveated_encoding: false,
         encoder_high_profile: false,
@@ -284,6 +342,10 @@ fn client_thread(
 
     let mut deadline = Instant::now();
     'main_loop: loop {
+        if shutting_down.value() {
+            break 'main_loop;
+        }
+
         let input_lock = window_input.read();
 
         while let Some(event) = client_core_context.poll_event() {
@@ -359,12 +421,12 @@ fn client_thread(
 
     streaming.set(false);
     if let Some(thread) = maybe_tracking_thread {
-        thread.join().unwrap();
+        thread.join().ok();
     }
 
-    client_core_context.pause()
-
-    // client_core_context destroy is called here on drop
+    // Do not call pause(): it waits on disconnected_notif and can hang while the
+    // handshake listener still owns CONTROL_PORT (9943). Dropping the context
+    // sets ShuttingDown and joins the connection thread instead.
 }
 
 fn main() {
@@ -374,18 +436,40 @@ fn main() {
 
     let (input_sender, input_receiver) = mpsc::channel::<WindowInput>();
     let (output_sender, output_receiver) = mpsc::channel::<WindowOutput>();
+    let shutting_down = Arc::new(RelaxedAtomic::new(false));
 
     let client_thread = thread::spawn({
         let initial_input = initial_input.clone();
+        let shutting_down = Arc::clone(&shutting_down);
         move || {
-            client_thread(output_sender, input_receiver, initial_input);
+            client_thread(
+                output_sender,
+                input_receiver,
+                initial_input,
+                shutting_down,
+            );
         }
     });
+
+    let ico = IconDir::read(Cursor::new(include_bytes!("../resources/client_mock.ico"))).unwrap();
+    let image = ico
+        .entries()
+        .iter()
+        .max_by_key(|e| e.width() as u32 * e.height() as u32)
+        .unwrap()
+        .decode()
+        .unwrap();
 
     eframe::run_native(
         "Mock client",
         NativeOptions {
-            viewport: ViewportBuilder::default().with_inner_size((400.0, 400.0)),
+            viewport: ViewportBuilder::default()
+                .with_inner_size((420.0, 480.0))
+                .with_icon(IconData {
+                    rgba: image.rgba_data().to_owned(),
+                    width: image.width(),
+                    height: image.height(),
+                }),
             renderer: Renderer::Glow,
             ..Default::default()
         },
@@ -394,6 +478,7 @@ fn main() {
                 initial_input,
                 input_sender,
                 output_receiver,
+                shutting_down,
             )))
         }),
     )

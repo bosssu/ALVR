@@ -1,17 +1,23 @@
+// Hide the extra Windows console when launching the mock GUI (release).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
 use alvr_common::{
-    DeviceMotion, HEAD_ID, Pose, RelaxedAtomic, ViewParams,
+    DeviceMotion, Fov, HEAD_ID, Pose, RelaxedAtomic, ViewParams,
     glam::{Quat, UVec2, Vec3},
     parking_lot::RwLock,
 };
 use alvr_packets::{FaceData, TrackingData};
 use alvr_session::CodecType;
 use eframe::{
-    Frame, NativeOptions,
+    Frame, NativeOptions, Renderer,
     egui::{CentralPanel, RichText, Slider, Ui, ViewportBuilder},
 };
+use serde::{Deserialize, Serialize};
 use std::{
     f32::consts::{FRAC_PI_2, PI},
+    fs,
+    path::PathBuf,
     sync::{
         Arc,
         mpsc::{self, TryRecvError},
@@ -20,11 +26,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 struct WindowInput {
     height: f32,
     yaw: f32,
     pitch: f32,
+    ipd_mm: f32,
     use_random_orientation: bool,
     emulated_decode_ms: u64,
     emulated_compositor_ms: u64,
@@ -37,11 +45,36 @@ impl Default for WindowInput {
             height: 1.5,
             yaw: 0.0,
             pitch: 0.0,
-            use_random_orientation: true,
+            ipd_mm: 63.0,
+            use_random_orientation: false,
             emulated_decode_ms: 5,
             emulated_compositor_ms: 1,
             emulated_vsync_ms: 25,
         }
+    }
+}
+
+fn settings_path() -> PathBuf {
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let dir = base.join("ALVR").join("client_mock");
+    let _ = fs::create_dir_all(&dir);
+    dir.join("settings.json")
+}
+
+fn load_window_input() -> WindowInput {
+    let path = settings_path();
+    let Ok(text) = fs::read_to_string(&path) else {
+        return WindowInput::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn save_window_input(input: &WindowInput) {
+    let path = settings_path();
+    if let Ok(text) = serde_json::to_string_pretty(input) {
+        let _ = fs::write(path, text);
     }
 }
 
@@ -77,11 +110,13 @@ pub struct Window {
 
 impl Window {
     fn new(
+        input: WindowInput,
         input_sender: mpsc::Sender<WindowInput>,
         output_receiver: mpsc::Receiver<WindowOutput>,
     ) -> Self {
+        let _ = input_sender.send(input.clone());
         Self {
-            input: WindowInput::default(),
+            input,
             input_sender,
             output: WindowOutput::default(),
             output_receiver,
@@ -122,6 +157,10 @@ impl eframe::App for Window {
                 ui.label("Pitch:");
                 ui.add(Slider::new(&mut input.pitch, -FRAC_PI_2..=FRAC_PI_2));
             });
+            ui.horizontal(|ui| {
+                ui.label("IPD (mm):");
+                ui.add(Slider::new(&mut input.ipd_mm, 50.0..=80.0));
+            });
             ui.checkbox(
                 &mut input.use_random_orientation,
                 "Use randomized orientation offset",
@@ -130,12 +169,33 @@ impl eframe::App for Window {
 
         if input != self.input {
             self.input = input;
-
+            save_window_input(&self.input);
             self.input_sender.send(self.input.clone()).ok();
         }
 
         ui.request_repaint();
     }
+}
+
+fn stereo_view_params(ipd_m: f32) -> [ViewParams; 2] {
+    let half = ipd_m * 0.5;
+    let fov = Fov::DUMMY;
+    [
+        ViewParams {
+            pose: Pose {
+                orientation: Quat::IDENTITY,
+                position: Vec3::new(-half, 0.0, 0.0),
+            },
+            fov,
+        },
+        ViewParams {
+            pose: Pose {
+                orientation: Quat::IDENTITY,
+                position: Vec3::new(half, 0.0, 0.0),
+            },
+            fov,
+        },
+    ]
 }
 
 fn tracking_thread(
@@ -145,11 +205,19 @@ fn tracking_thread(
     input: Arc<RwLock<WindowInput>>,
 ) {
     let timestamp_origin = Instant::now();
-    context.send_view_params([ViewParams::DUMMY; 2]);
+    let mut last_ipd_m = -1.0_f32;
+    let mut ticks = 0_u32;
+    context.send_proximity_state(true);
 
     let mut loop_deadline = Instant::now();
     while streaming.value() {
         let input_lock = input.read();
+        let ipd_m = (input_lock.ipd_mm / 1000.0).clamp(0.04, 0.09);
+        ticks = ticks.saturating_add(1);
+        if ticks < 30 || (ipd_m - last_ipd_m).abs() > 0.0005 {
+            context.send_view_params(stereo_view_params(ipd_m));
+            last_ipd_m = ipd_m;
+        }
 
         let mut orientation =
             Quat::from_rotation_y(input_lock.yaw) * Quat::from_rotation_x(input_lock.pitch);
@@ -188,6 +256,7 @@ fn tracking_thread(
 fn client_thread(
     output_sender: mpsc::Sender<WindowOutput>,
     input_receiver: mpsc::Receiver<WindowInput>,
+    initial_input: WindowInput,
 ) {
     let capabilities = ClientCapabilities {
         platform: alvr_system_info::platform(None, None),
@@ -211,7 +280,7 @@ fn client_thread(
     let mut maybe_tracking_thread = None;
 
     let mut window_output = WindowOutput::default();
-    let window_input = Arc::new(RwLock::new(WindowInput::default()));
+    let window_input = Arc::new(RwLock::new(initial_input));
 
     let mut deadline = Instant::now();
     'main_loop: loop {
@@ -301,20 +370,32 @@ fn client_thread(
 fn main() {
     env_logger::init();
 
+    let initial_input = load_window_input();
+
     let (input_sender, input_receiver) = mpsc::channel::<WindowInput>();
     let (output_sender, output_receiver) = mpsc::channel::<WindowOutput>();
 
-    let client_thread = thread::spawn(|| {
-        client_thread(output_sender, input_receiver);
+    let client_thread = thread::spawn({
+        let initial_input = initial_input.clone();
+        move || {
+            client_thread(output_sender, input_receiver, initial_input);
+        }
     });
 
     eframe::run_native(
         "Mock client",
         NativeOptions {
             viewport: ViewportBuilder::default().with_inner_size((400.0, 400.0)),
+            renderer: Renderer::Glow,
             ..Default::default()
         },
-        Box::new(|_| Ok(Box::new(Window::new(input_sender, output_receiver)))),
+        Box::new(move |_| {
+            Ok(Box::new(Window::new(
+                initial_input,
+                input_sender,
+                output_receiver,
+            )))
+        }),
     )
     .ok();
 

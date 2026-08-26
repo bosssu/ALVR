@@ -19,6 +19,7 @@ use alvr_packets::{
     VIDEO, VideoPacketHeader, VideoStreamingCapabilities, VideoStreamingCapabilitiesExt,
 };
 use alvr_session::{SocketProtocol, settings_schema::Switch};
+use alvr_system_info::Platform;
 use alvr_sockets::{
     ControlSocketSender, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, PeerType, ProtoControlSocket,
     StreamSender, StreamSocketBuilder,
@@ -338,22 +339,38 @@ fn connection_pipeline(
     });
 
     let game_audio_thread = if let Switch::Enabled(config) = settings.audio.game_audio {
-        let device = alvr_audio::new_output(None).to_con()?;
-        thread::spawn({
-            let ctx = Arc::clone(&ctx);
-            move || {
-                while is_streaming(&ctx) {
-                    alvr_common::show_err(audio::play_audio_loop(
-                        || is_streaming(&ctx),
-                        &device,
-                        2,
-                        negotiated_config.game_audio_sample_rate,
-                        config.buffering.clone(),
-                        &mut game_audio_receiver,
-                    ));
+        // PC mock shares the streamer's speakers. Playing the streamed copy here
+        // double-plays game audio and feeds WASAPI loopback (echo / 10053).
+        if capabilities.platform == Platform::WindowsPc {
+            thread::spawn({
+                let ctx = Arc::clone(&ctx);
+                move || {
+                    while is_streaming(&ctx) {
+                        match game_audio_receiver.recv(STREAMING_RECV_TIMEOUT) {
+                            Ok(_) | Err(ConnectionError::TryAgain(_)) => continue,
+                            Err(ConnectionError::Other(_)) => return,
+                        }
+                    }
                 }
-            }
-        })
+            })
+        } else {
+            let device = alvr_audio::new_output(None).to_con()?;
+            thread::spawn({
+                let ctx = Arc::clone(&ctx);
+                move || {
+                    while is_streaming(&ctx) {
+                        alvr_common::show_err(audio::play_audio_loop(
+                            || is_streaming(&ctx),
+                            &device,
+                            2,
+                            negotiated_config.game_audio_sample_rate,
+                            config.buffering.clone(),
+                            &mut game_audio_receiver,
+                        ));
+                    }
+                }
+            })
+        }
     } else {
         thread::spawn(|| ())
     };
@@ -374,6 +391,7 @@ fn connection_pipeline(
                         &device,
                         1,
                         false,
+                        None,
                     ) {
                         Ok(()) => break,
                         Err(e) => {

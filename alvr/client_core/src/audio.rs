@@ -26,6 +26,7 @@ pub fn record_audio_blocking(
     device: &Device,
     channels_count: u16,
     mute: bool,
+    _tee: Option<Box<dyn FnMut(&[u8]) + Send>>,
 ) -> Result<()> {
     assert_eq!(
         channels_count, 1,

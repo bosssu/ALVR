@@ -13,6 +13,11 @@ alvr_packets.workspace = true
 alvr_session.workspace = true
 alvr_system_info.workspace = true
 
-eframe = "0.35"
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "glow",
+] }
 env_logger = "0.11"
 rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

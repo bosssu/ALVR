@@ -250,6 +250,8 @@ dependencies = [
  "eframe",
  "env_logger",
  "rand 0.10.1",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1826,6 +1828,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "egui_glow",
+ "glow 0.17.0",
  "glutin",
  "glutin-winit",
  "image",
